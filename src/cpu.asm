@@ -1,17 +1,24 @@
-; src/cpu.asm — AURORA virtual CPU: fetch/decode/execute loop.
+; src/cpu.asm — AURORA virtual CPU: fetch/decode/execute.
 ;
-; Phase 3. 100% x86-64 Assembly, Linux syscalls only, no libc.
+; Phase 3 (core) + phase 5 (single-step extraction). 100% x86-64 Assembly,
+; Linux syscalls only, no libc.
 ;
-; Entry: cpu_run(rdi = max_steps). Never returns.
+; Entry points:
+;   cpu_run(rdi = max_steps). Never returns.
+;   cpu_step(). Executes exactly ONE guest instruction and returns:
+;       rax = 0: instruction executed, VM still running
+;       rax = 1: HALT (NORMAL termination, D22); rdx = exit code (R0 & 0xFF)
+;       rax = 2: fatal error; rdx = error id (1..12)
+;     cpu_step never exits the process; it preserves rbx, rbp, r12-r15.
+;     The debugger (phase 5) drives execution through cpu_step. There is
+;     exactly one implementation of the 43 instruction handlers — the
+;     debugger observes and controls, it does not re-execute.
 ;   Precondition (established by the loader, docs/BYTECODE.md §5):
 ;     vm_mem[0..code_size)            = code bytes (read-only for the guest)
 ;     vm_mem[code_size..code_size+data_size) = data bytes
 ;     vm_mem elsewhere                = 0x00
 ;     vm_regs: R0-R15 = 0, PC = entry, SP = FP = 0x10000, FLAGS = 0
 ;     vm_code_size                    = code_size
-;   HALT  -> sys_exit(R0 & 0xFF)            (termination_class = NORMAL)
-;   fatal -> fatal_error(id, NULL)          (termination_class = FATAL,
-;                                           exit code = 100 + id, D22)
 ;
 ; Execution loop (normative pseudocode, docs/ISA.md §7):
 ;     steps = 0
@@ -22,6 +29,10 @@
 ;         instr = MEM[PC..PC+8); op = instr[0]
 ;         if op > 0x2A: die(INVALID_OPCODE)
 ;         dispatch(op, instr)
+;
+; The step counter and limit live in globals so the debugger can observe
+; and configure them: vm_steps (u64, incremented once per cpu_step),
+; vm_max_steps (u64, 0 = unlimited).
 ;
 ; Host register allocation (guest state lives in vm_regs / vm_mem):
 ;     rbx = guest memory base (&vm_mem, constant)
@@ -42,6 +53,9 @@ default rel
 %include "src/errids.inc"
 
 global cpu_run
+global cpu_step
+global vm_steps
+global vm_max_steps
 
 extern vm_mem
 extern vm_regs
@@ -50,6 +64,8 @@ extern fatal_error
 
 section .bss
 out_buf:    resb 32                 ; decimal conversion buffer for OUT
+vm_steps:   resq 1                  ; instructions executed (u64)
+vm_max_steps: resq 1                ; step limit (u64, 0 = unlimited)
 
 section .rodata
 s_i64min:   db "-9223372036854775808"
@@ -126,13 +142,42 @@ section .text
     mov r10d, edx
 %endmacro
 
-; NEXT — fall through to the next sequential instruction.
+; NEXT — finish the current instruction: advance to the next sequential
+; slot and return from cpu_step with status 0 (still running).
 %macro NEXT 0
     add r15, 8
-    jmp cpu_loop
+    jmp step_done
 %endmacro
 
+; cpu_run(rdi = max_steps). Never returns.
+; The phase-3 execution loop, now structured over cpu_step. Observable
+; behavior is unchanged: HALT exits with R0 & 0xFF; a fatal error prints
+; "aurora: error: <NAME>" to stderr and exits with 100 + id (D22).
 cpu_run:
+    mov [vm_max_steps], rdi         ; 0 = unlimited (ISA §7)
+    mov qword [vm_steps], 0
+.loop:
+    call cpu_step                   ; rax = status, rdx = payload
+    test rax, rax
+    jz .loop                        ; status 0: keep executing
+    cmp eax, 1
+    je .halt
+    mov edi, edx                    ; status 2: fatal error, rdx = id
+    xor esi, esi
+    jmp fatal_error                 ; never returns
+.halt:                              ; status 1: HALT (NORMAL, D22)
+    mov edi, edx                    ; exit code = R0 & 0xFF
+    mov eax, 60                     ; sys_exit
+    syscall
+    ud2
+
+; cpu_step() — execute exactly one guest instruction.
+; Returns rax = 0 (executed, still running), 1 (HALT; rdx = exit code),
+;         2 (fatal error; rdx = error id 1..12).
+; Never exits the process. Preserves rbx, rbp, r12-r15.
+; The debugger drives the VM through this function; the 43 handlers below
+; remain the single implementation of instruction semantics.
+cpu_step:
     push rbx
     push r12
     push r13
@@ -140,11 +185,10 @@ cpu_run:
     push r15
     lea rbx, [vm_mem]               ; guest memory base
     mov r14, [vm_code_size]         ; code_size
-    mov r13, rdi                    ; max_steps (0 = unlimited)
-    xor r12d, r12d                  ; steps = 0
-    mov r15, [vm_regs + VM_OFF_PC]  ; PC = entry
+    mov r13, [vm_max_steps]         ; max_steps (0 = unlimited)
+    mov r12, [vm_steps]             ; steps executed so far
+    mov r15, [vm_regs + VM_OFF_PC]  ; PC = entry / resume point
 
-cpu_loop:
     mov [vm_regs + VM_OFF_PC], r15  ; publish PC (architectural state)
     ; -- max-steps (ISA.md §7: checked before the increment) --
     test r13, r13
@@ -153,6 +197,7 @@ cpu_loop:
     jae die_max_steps_exceeded
 .no_limit:
     inc r12                         ; steps += 1 (u64; cannot wrap in practice)
+    mov [vm_steps], r12
     ; -- PC validation (defense in depth; static targets pre-validated) --
     cmp r15, r14
     jae die_invalid_pc              ; PC >= code_size
@@ -165,15 +210,33 @@ cpu_loop:
     ja die_invalid_opcode           ; defense in depth (loader rejects these)
     jmp [dispatch + rcx*8]
 
+; step_done — normal instruction completion: publish the final PC and
+; return status 0. All sequential handlers (NEXT) and control-flow
+; handlers (CALL/RET/jumps, which set r15 directly) converge here.
+step_done:
+    xor eax, eax                    ; status 0 = still running
+    jmp step_ret
+; step_fatal — entered via die_* with edx = error id: return status 2.
+step_fatal:
+    mov eax, 2                      ; status 2 = fatal error
+    jmp step_ret
+step_ret:
+    mov [vm_regs + VM_OFF_PC], r15  ; publish final PC
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; ---------------------------------------------------------------- system ---
 h_nop:                              ; 0x00 NOP — no operation, flags unchanged
     NEXT
 
 h_halt:                             ; 0x01 HALT — NORMAL termination (D22)
-    movzx edi, byte [vm_regs]       ; exit code = R0 & 0xFF
-    mov eax, 60                     ; sys_exit
-    syscall
-    ud2                             ; unreachable
+    movzx edx, byte [vm_regs]       ; exit code = R0 & 0xFF
+    mov eax, 1                      ; status 1 = HALT
+    jmp step_ret
 
 ; ---------------------------------------------------------- data movement ---
 h_mov_rr:                           ; 0x02 MOV Rd, Rs — flags unchanged
@@ -564,7 +627,7 @@ h_call:                             ; 0x1F CALL a32
     mov [vm_regs + VM_OFF_SP], r8
     mov [vm_regs + VM_OFF_FP], r8   ; FP = SP
     mov r15, r9                     ; PC = target
-    jmp cpu_loop
+    jmp step_done
 
 h_ret:                              ; 0x20 RET
     mov r8, [vm_regs + VM_OFF_FP]
@@ -583,7 +646,7 @@ h_ret:                              ; 0x20 RET
     jae die_invalid_pc
     test r15b, 7
     jnz die_invalid_pc
-    jmp cpu_loop
+    jmp step_done
 
 ; ------------------------------------------------------------ control flow ---
 h_jmp:                              ; 0x21 JMP a32
@@ -664,17 +727,19 @@ jcc_take:
     test al, 7
     jnz die_invalid_pc
     mov r15, rax                    ; PC = target
-    jmp cpu_loop
+    jmp step_done
 jcc_next:
     add r15, 8
-    jmp cpu_loop
+    jmp step_done
 
 ; --------------------------------------------------------------------- i/o ---
 h_out:                              ; 0x28 OUT Rs — signed decimal + '\n'
     shr rax, 16
     movzx ecx, al                   ; src register (normative: byte 2)
     mov rax, [vm_regs + rcx*8]
-    call out_i64                    ; preserves rbx, r12-r15
+    call out_i64                    ; preserves rbx, r12-r15; rax = 0/-1
+    test rax, rax
+    js die_io_error
     NEXT
 
 h_outc:                             ; 0x29 OUTC Rs — low byte of Rs
@@ -685,7 +750,9 @@ h_outc:                             ; 0x29 OUTC Rs — low byte of Rs
     mov edi, 1                      ; stdout
     lea rsi, [out_buf]
     mov edx, 1
-    call write_all
+    call write_all                  ; rax = 0 ok, -1 error
+    test rax, rax
+    js die_io_error
     NEXT
 
 h_in:                               ; 0x2A IN Rd — 1 byte; EOF -> 0xFFF...F
@@ -748,11 +815,14 @@ out_i64:
     mov rsi, r9
     lea rdx, [out_buf + 32]
     sub rdx, r9                     ; length
-    jmp write_all                   ; tail call
+    call write_all                  ; rax = 0 ok, -1 error
+    ret
 
 ; write_all — write rdx bytes from rsi to fd rdi; loops on short writes.
-; Dies with IO_ERROR on error (or zero progress). Clobbers rax, rcx, r11.
-; Preserves rbx, r12-r15, rbp.
+; Returns rax = 0 on success, rax = -1 on error (or zero progress).
+; Does NOT jump to die_* (it may be called from nested contexts like
+; out_i64 where the cpu_step stack frame is not on top).
+; Clobbers rax, rcx, r11. Preserves rbx, r12-r15, rbp.
 write_all:
     test rdx, rdx
     jz .done
@@ -760,52 +830,50 @@ write_all:
     mov eax, 1                      ; sys_write
     syscall
     test rax, rax
-    jle die_io_error
+    jle .err
     sub rdx, rax
     je .done
     add rsi, rax
     jmp .loop
 .done:
+    xor eax, eax                    ; success
+    ret
+.err:
+    mov rax, -1                     ; error (64-bit!)
     ret
 
 ; ------------------------------------------------------------ fatal errors ---
-; Each site: rdi = error id, rsi = NULL detail; fatal_error never returns
-; (prints "aurora: error: <NAME>" to stderr, exits 100 + id).
+; Each site: edx = error id; control flows to step_fatal, which returns
+; status 2 (rdx = id) from cpu_step. cpu_run converts that into the
+; phase-3 behavior: fatal_error(id, NULL) — "aurora: error: <NAME>" on
+; stderr, exit 100 + id (D22). The debugger reports the termination
+; itself and stays in the REPL.
 die_invalid_opcode:
-    mov edi, ERR_INVALID_OPCODE
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_INVALID_OPCODE
+    jmp step_fatal
 die_invalid_mem:
-    mov edi, ERR_INVALID_MEMORY_ACCESS
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_INVALID_MEMORY_ACCESS
+    jmp step_fatal
 die_stack_overflow:
-    mov edi, ERR_STACK_OVERFLOW
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_STACK_OVERFLOW
+    jmp step_fatal
 die_stack_underflow:
-    mov edi, ERR_STACK_UNDERFLOW
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_STACK_UNDERFLOW
+    jmp step_fatal
 die_division_by_zero:
-    mov edi, ERR_DIVISION_BY_ZERO
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_DIVISION_BY_ZERO
+    jmp step_fatal
 die_invalid_pc:
-    mov edi, ERR_INVALID_PC
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_INVALID_PC
+    jmp step_fatal
 die_max_steps_exceeded:
-    mov edi, ERR_MAX_STEPS_EXCEEDED
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_MAX_STEPS_EXCEEDED
+    jmp step_fatal
 die_write_to_code:
-    mov edi, ERR_WRITE_TO_CODE
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_WRITE_TO_CODE
+    jmp step_fatal
 die_io_error:
-    mov edi, ERR_IO_ERROR
-    xor esi, esi
-    jmp fatal_error
+    mov edx, ERR_IO_ERROR
+    jmp step_fatal
 
 section .note.GNU-stack noalloc noexec nowrite progbits

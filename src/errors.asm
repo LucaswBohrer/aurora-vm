@@ -17,6 +17,7 @@ default rel
 global fatal_error
 global cli_error_with_arg
 global host_open_error
+global error_name
 
 extern print_fd
 extern cstr_len
@@ -78,6 +79,18 @@ error_names:
     dq n12, n12_len
 
 section .text
+
+; error_name(rdi = error id 1..12) -> rsi = name ptr, rdx = name length.
+; Phase 5: lets the debugger report fatal terminations by name (D22)
+; without duplicating the error table. Precondition: 1 <= id <= 12.
+error_name:
+    mov eax, edi
+    dec eax                     ; 0-based
+    shl rax, 4                  ; 16 bytes per entry
+    lea rcx, [error_names]
+    mov rsi, [rcx + rax]
+    mov rdx, [rcx + rax + 8]
+    ret
 
 fatal_error:
     push rbx

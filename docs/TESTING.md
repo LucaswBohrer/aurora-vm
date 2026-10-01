@@ -229,16 +229,22 @@ No RNG, no clocks, no host addresses leak into guest state.
 
 ## 8. L7 — Debugger tests
 
-Scripted sessions (`printf ... | aurora debug prog.bin`), asserting:
-- `registers` shows PC/SP/FP and R0–R15 in the documented format;
-- `step` advances exactly one instruction and prints the disassembly;
-- `break <addr>` + `continue` stops at the breakpoint;
-- `memory`/`stack` dump the documented ranges;
-- `backtrace` shows the FP chain for a 3-deep call;
-- `quit` exits 0;
-- on a program that faults: the debugger reports the fatal error name
-  (not a silent stop) and distinguishes it from `HALT` (different status
-  line — see `docs/DEBUGGER.md`).
+Automated in `tests/debug/run_debug_tests.py` (40 checks, run via
+`make test`). Scripted sessions (`printf ... | aurora debug prog.bin`),
+asserting:
+- `help`/`quit`: command list, exit 0; `debug --help` usage, exit 0;
+  missing file exits 2;
+- `run`/`continue`/`step [n]`: execution, single-step, multi-step;
+- `break`/`delete`/`breakpoints`: set at entry/middle, list, delete,
+  invalid address rejected;
+- `regs`/`registers`/`flags`: PC/SP/FP, R0–R15, Z/C/N/V;
+- `memory <addr> [count]`: hex and decimal addresses, counts, out-of-range
+  rejected; `stack`/`backtrace`;
+- `disasm`: 43-opcode display-only disassembler;
+- `reset`: restores snapshot, allows re-run; `set max-steps`;
+- D22: `DIVISION_BY_ZERO` (FATAL, 106) vs `HALT` R0=106 (NORMAL, 106);
+  commands rejected after termination;
+- determinism: identical output for identical sessions.
 
 ---
 

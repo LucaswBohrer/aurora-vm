@@ -250,7 +250,7 @@ aurora-vm/
 | 2 | Loader: header + instruction-slot validation | ✅ done |
 | 3 | CPU core: 43 handlers, flags, memory, stack, I/O | ✅ done |
 | 4 | Assembler (Python 3 stdlib) + sample programs | ✅ done |
-| 5 | Interactive debugger | ⬜ next |
+| 5 | Interactive debugger | ✅ done |
 | 6 | Fib(30) stress + full program suite | ⬜ planned |
 | 7 | Full suite + fuzzing + final docs | ⬜ planned |
 

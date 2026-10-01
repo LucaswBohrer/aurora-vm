@@ -27,6 +27,26 @@ run_test() {
     fi
 }
 
+# run_test_pipe <name> <expected_exit> <expected_substring> <stdin> [args...]
+# Like run_test but feeds <stdin> to the program (for interactive commands).
+run_test_pipe() {
+    name="$1"; exp_exit="$2"; exp_sub="$3"; stdin_data="$4"; shift 4
+    out="$(printf '%s' "$stdin_data" | "$BIN" "$@" 2>&1)"
+    code=$?
+    if [ -z "$exp_sub" ]; then
+        [ -z "$out" ] && out_ok=1 || out_ok=0
+    else
+        printf '%s' "$out" | grep -qF -- "$exp_sub" && out_ok=1 || out_ok=0
+    fi
+    if [ "$code" -eq "$exp_exit" ] && [ "$out_ok" -eq 1 ]; then
+        PASS=$((PASS + 1))
+        printf 'PASS: %s\n' "$name"
+    else
+        FAIL=$((FAIL + 1))
+        printf 'FAIL: %s (exit=%s want %s; output=[%s])\n' "$name" "$code" "$exp_exit" "$out"
+    fi
+}
+
 if [ ! -x "$BIN" ]; then
     printf 'FAIL: binary not executable: %s\n' "$BIN"
     exit 1
@@ -73,7 +93,7 @@ run_test "run-extra-operand"    2 "run: unexpected operand 'extra'" run "$TMP/em
 run_test "unknown-command"      2 "unknown command 'frobnicate'" frobnicate
 run_test "debug-missing-file"   2 "expected exactly one file operand" debug
 run_test "debug-nonexistent"    2 "debug: cannot open"            debug "$TMP/nope.bin"
-run_test "debug-noexec"         3 "not implemented in this build" debug "$TMP/halt.bin"
+run_test_pipe "debug-exec-quit" 0 "AURORA debugger" "quit\n"      debug "$TMP/halt.bin"
 run_test "debug-empty-file"     108 "INVALID_PROGRAM"             debug "$TMP/empty.bin"
 run_test "debug-extra-operand"  2 "expected exactly one file operand" debug "$TMP/empty.bin" extra
 

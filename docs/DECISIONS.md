@@ -304,3 +304,36 @@ new semantic the frozen spec does not define.
 field placement, the V1–V9 byte-exact golden comparison, and 33
 negative diagnostics. The golden vectors in ISA §12 remain the
 normative authority and stay assembler-independent.
+
+## D24 — Debugger: observation layer, not a second CPU (2026-10-01)
+
+**Context:** Phase 5 adds `aurora debug`, an interactive debugger.
+
+**Decision:** The debugger reuses `cpu_step()` — the same single-instruction
+function the runner uses — instead of reimplementing fetch/decode/execute.
+Breakpoints live in a 16-slot debugger-side table (`dbg_bps`); the guest
+bytecode is never patched. The disassembler is display-only.
+
+**`reset` semantics:** `reset` restores the post-load snapshot (registers +
+full memory) and clears steps/termination. Breakpoints are kept, per Lucas's
+explicit guidance that they "may remain configured" — they are debugger
+configuration, not guest state.
+
+**Consequences:** ISA, bytecode, and CPU semantics stay frozen. `step n`
+always executes the first instruction (breakpoint check starts at the 2nd
+fetch) so a breakpoint at the current PC cannot wedge the session.
+Termination follows D22 explicitly (NORMAL/FATAL + reason).
+
+## D25 — `write_all` returns status instead of dying from nested calls
+
+**Context:** `OUT → out_i64 → write_all` (and `OUTC → write_all`) are nested
+host calls inside `cpu_step`. The old `write_all` jumped to `die_io_error`
+directly, which would unwind to `step_ret` with stale return addresses on
+the host stack.
+
+**Decision:** `write_all` returns `rax = 0` (ok) / `-1` (error). The `h_out`
+and `h_outc` handlers check and jump to `die_io_error` themselves, at the
+top-level handler frame where the stack layout is known.
+
+**Consequences:** I/O errors remain fatal (`IO_ERROR`, exit 100+id) with a
+safe unwind. No behavior change on success.
