@@ -368,3 +368,43 @@ reserved. Services introduce no new fatal errors — host I/O failures and
 code-segment stores propagate as the ISA's own `IO_ERROR` /
 `WRITE_TO_CODE`. Determinism (ISA §9) is preserved: no clock, no random,
 no nondeterministic service in ABI v1.
+
+## D27 — AURORA Object Format v1 and static linker: multi-module programs without touching the ISA (2026-10-01)
+
+**Context:** Phase 7 asks for multi-module composition (`main.o + math.o
++ runtime.o → program.bin`). The ISA is frozen (D01), the executable
+bytecode v1 and its entry semantics are frozen, and D26 deliberately
+defines the runtime as a *guest-side library* whose phase-6 composition
+model is source concatenation (`cat main.asm runtime/aurora_rt.asm`) —
+which re-assembles the runtime for every program and makes symbol
+conflicts between modules undetectable until assembly. A dynamic
+linker, PLT/GOT, lazy binding, or any new opcode/trap is explicitly out
+of scope for this phase. The audit (ISA §4–§6.10 + assembler pass 2 +
+loader validation) shows exactly three kinds of symbolic references
+need relocation: class-J jump/CALL targets (absolute code offsets),
+`MOV Rd, label` (absolute address), and class-M `[label]` (absolute
+address). Nothing in the ISA is PC-relative (D07); data directives
+cannot reference labels.
+
+**Decision:** a minimal AURORA-specific object format (`docs/OBJECT_FORMAT.md`)
+with a fixed 48-byte header, `.code` + `.data` sections, a 76-byte
+symbol entry (LOCAL/GLOBAL/UNDEFINED, name/section/offset) and a 12-byte
+relocation entry with exactly three types (`CODE32`, `ADDR32`, `MEM32` —
+one per symbolic reference kind, no addends, no generic `ABS32`). A host
+tool `tools/aurora-ld` resolves globals, lays out
+`[code of all objects][data of all objects]` in link order, patches
+relocations with range validation (link error, never truncation), and
+emits plain executable bytecode v1 with `entry = 0`. The assembler
+grows a `-c` flag and a `.global` directive; its direct `.asm → .bin`
+flow is unchanged. Link order is significant and documented: the first
+object provides the entry code (`entry = 0`, no new header field, no
+magic entry symbol). The linker knows symbols and relocations only —
+nothing about CPU semantics, and nothing special about `svc_*`; the
+runtime links as an ordinary module (D26 intact).
+
+**Consequences:** ISA, bytecode v1, loader, CPU, debugger, calling
+convention, the 12 fatal errors, and D22/D25/D26 are untouched; the
+CPU cannot tell a linked binary from an assembled one. Out of scope
+for v1: weak/versioned symbols, `.bss`, string tables, addends,
+PC-relative relocations, section GC, LTO, dynamic linking. If any of
+these becomes necessary, the D19/D14 change protocol applies.

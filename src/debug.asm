@@ -1211,7 +1211,7 @@ cmd_memory:
     xor r13d, r13d                     ; done = 0
 .line:
     cmp r13, r14
-    je .done
+    jae .done
     mov rax, rbx
     add rax, r13
     call dbg_print_addr

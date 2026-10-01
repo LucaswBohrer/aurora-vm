@@ -20,9 +20,10 @@ L5  Fuzzing             mutational bytecode fuzzing, safety oracle
 L6  Determinism         repeated runs, byte-identical results
 L7  Debugger            scripted REPL sessions
 L8  Runtime ABI         service contract, memory safety, golden fixtures
+L9  Linker              object format, symbols, relocations, multi-module runs
 ```
 
-`make test` runs L1–L4, L6, L7, L8. `make fuzz` runs L5 (bounded iterations).
+`make test` runs L1–L4, L6, L7, L8, L9. `make fuzz` runs L5 (bounded iterations).
 
 ---
 
@@ -230,7 +231,7 @@ No RNG, no clocks, no host addresses leak into guest state.
 
 ## 8. L7 — Debugger tests
 
-Automated in `tests/debug/run_debug_tests.py` (40 checks, run via
+Automated in `tests/debug/run_debug_tests.py` (44 checks, run via
 `make test`). Scripted sessions (`printf ... | aurora debug prog.bin`),
 asserting:
 - `help`/`quit`: command list, exit 0; `debug --help` usage, exit 0;
@@ -289,7 +290,46 @@ debugger sessions only exercise `svc_write`/`svc_exit`.
 
 ---
 
-## 10. Test harness conventions
+## 10. L9 — Linker tests
+
+Automated in `tests/linker/run_linker_tests.py` (run via
+`make test`), pinning `docs/OBJECT_FORMAT.md` (object format v1) and
+`docs/LINKER.md` (static linker, `tools/aurora-ld`):
+
+- **object validation:** bad magic, bad version, non-zero reserved
+  bytes, header field overflow, overlapping descriptors, truncated
+  blobs, corrupt sections/symbols/relocations, relocation sites that
+  are not four zero bytes, non-LOCAL forward declarations, symbol
+  sections other than CODE/DATA, section offsets beyond EOF — all
+  rejected with `aurora-ld: error:` and exit 1;
+- **symbol model:** LOCAL defined, GLOBAL defined, UNDEFINED reference,
+  duplicate definitions, undefined-at-link, global-shadows-local,
+  name-length edge (64 bytes), malformed UTF-8 names — resolved exactly
+  per the documented rules;
+- **relocation model:** `CODE32`/`ADDR32`/`MEM32` applied at the right
+  offsets; numeric operands untouched; data directives never relocated;
+  relocation into a jump slot that lands mid-instruction caught by the
+  executable-level validator;
+- **layout and entry:** first object on the CLI supplies entry 0; code
+  concatenation order; data placed after code (`code_size + data_off`);
+  total ≤ `0xF000`;
+- **CLI:** `--help`/`--version`, missing `-o`, missing inputs, output
+  write failure → exit 2 (usage) / exit 1 (link error);
+- **determinism:** two links of the same inputs byte-identical;
+- **multi-module execution:** `examples/linker/` programs linked and
+  run (`main.o + math.o` → `50/21/5`; `echo_main.o + runtime.o`
+  → echo), debugger session on a linked binary (breakpoint
+  cross-module, `regs`, `memory`);
+- **assembler `-c`:** `aurora-asm -c` emits byte-valid objects with the
+  documented symbols and relocations; direct `.asm → .bin` flow
+  byte-identical before and after the `-c` integration;
+- **independence (L1 principle):** manual golden `.o` fixtures written
+  with Python `struct` (no assembler, no linker) plus an independent
+  re-parser of the emitted objects inside the suite itself.
+
+---
+
+## 11. Test harness conventions
 
 - Runner: `tests/run_tests.sh` (POSIX sh). Each test prints
   `PASS`/`FAIL: <name> (<reason>)`; the suite exits nonzero on any

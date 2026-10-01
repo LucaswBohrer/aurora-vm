@@ -425,6 +425,27 @@ any guest code; fatal errors inside a service propagate as the ISA's own
 `IO_ERROR`/`WRITE_TO_CODE`. Deterministic: no clock, no random
 (`docs/RUNTIME.md` is the normative ABI reference).
 
+## 6c. Linker & object format design (phase 7)
+
+The linker (D27) enables multi-module programs without touching the
+frozen ISA, bytecode v1, CPU, loader, debugger or calling convention.
+`tools/aurora-asm -c` emits an AURORA object (`.o`): a relocatable
+module with a `.code` section, a `.data` section, a symbol table
+(`LOCAL` / `GLOBAL` / `UNDEFINED` bindings) and a relocation table
+(`CODE32` for `CALL`/`JMP`/Jcc targets, `ADDR32` for `MOV Rd,label`,
+`MEM32` for `LOAD`/`STORE [label]`). `tools/aurora-ld` validates each
+object, resolves symbols (locals first, then globals, then undefined),
+concatenates code segments in link order, places data segments right
+after code (`code_size + data_offset`), and writes absolute 32-bit
+addresses into the four zero bytes at each relocation site. Entry stays
+0: the first object on the link line supplies the initial code. The
+runtime library is linked as an ordinary module (its `svc_*` symbols
+are `GLOBAL`). The emitted executable is exactly bytecode v1, so the
+loader's existing validations (jump targets `< code_size`, 8-aligned,
+`code_size + data_size ≤ 0xF000`) continue to apply unchanged. Full
+specification: `docs/OBJECT_FORMAT.md` and `docs/LINKER.md` (both
+normative).
+
 ---
 
 ## 7. Project structure
@@ -444,16 +465,19 @@ aurora-vm/
 │   ├── errors.asm      ; error table + die()
 │   └── util.asm        ; string/hex/parse helpers
 ├── tools/
-│   └── aurora-asm      ; assembler (Python 3, stdlib only, executable)
+│   ├── aurora-asm      ; assembler (Python 3, stdlib only, executable; -c → .o, phase 7)
+│   └── aurora-ld       ; static linker (phase 7)
 ├── runtime/
 │   └── aurora_rt.asm   ; ABI v1 guest-side library (svc_exit/svc_write/svc_read)
 ├── programs/           ; 7 sample programs (.asm)
 ├── examples/
-│   └── runtime/        ; hello/io/echo/exit via the runtime ABI (.asm)
+│   ├── runtime/        ; hello/io/echo/exit via the runtime ABI (.asm)
+│   └── linker/         ; multi-module examples: main+math, echo+runtime (phase 7)
 ├── tests/
 │   ├── run_tests.sh    ; runner
 │   ├── cpu/  mem/  stack/  asm/  byte/  vm/   ; fixtures + expectations
 │   ├── runtime/        ; L8 ABI tests + frozen golden .bin fixtures
+│   ├── linker/         ; L9 object-format/linker tests (phase 7)
 │   └── helpers.sh
 ├── docs/
 │   ├── ARCHITECTURE.md ; this file (evolves into the decision record)
@@ -462,6 +486,8 @@ aurora-vm/
 │   ├── ASSEMBLER.md    ; syntax + directives + diagnostics
 │   ├── DEBUGGER.md     ; commands + examples
 │   ├── RUNTIME.md      ; runtime ABI v1 contract (normative, phase 6)
+│   ├── OBJECT_FORMAT.md; AURORA object format v1 (normative, phase 7)
+│   ├── LINKER.md       ; static linker specification (normative, phase 7)
 │   ├── MEMORY.md       ; memory & stack model
 │   ├── ERRORS.md       ; error model + exit codes
 │   └── BUILD_TEST.md   ; build/run/test/clean instructions

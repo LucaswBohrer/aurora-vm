@@ -32,6 +32,7 @@ test: $(BIN)
 	python3 tests/asm/run_asm_tests.py
 	python3 tests/debug/run_debug_tests.py
 	python3 tests/runtime/run_runtime_tests.py
+	python3 tests/linker/run_linker_tests.py
 
 fuzz:
 	@echo "fuzzing is specified for a later phase (see docs/TESTING.md)"

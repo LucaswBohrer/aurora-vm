@@ -6,15 +6,21 @@
 ; ordinary function: the guest CALLs its entry point following the ABI
 ; contract documented in docs/RUNTIME.md.
 ;
-; Linking (static, by concatenation — the assembler has no INCLUDE):
+; Linking (static). Phase 7 added a real object linker; the runtime is
+; just another module:
+;
+;     python3 tools/aurora-asm -c prog.asm -o prog.o
+;     python3 tools/aurora-asm -c runtime/aurora_rt.asm -o rt.o
+;     python3 tools/aurora-ld prog.o rt.o -o prog.bin
+;
+; The old concatenation model still works (the assembler has no INCLUDE):
 ;
 ;     cat prog.asm runtime/aurora_rt.asm > /tmp/linked.asm
 ;     python3 tools/aurora-asm /tmp/linked.asm -o prog.bin
 ;
 ; Order does not matter for label resolution (two-pass assembly); the guest program comes first so entry point 0 is guest code.
 ; Labels starting with `svc_` are reserved by the runtime; guest programs
-; must not define them. (Labels may not start with R/r — the assembler
-; parses those as register operands.)
+; must not define them.
 ;
 ; Why guest-side? The frozen ISA has no trap/syscall instruction and no
 ; reserved CALL target: every CALL target must satisfy
@@ -24,6 +30,13 @@
 ; over existing instructions. The host boundary stays exactly where the
 ; ISA puts it: IN ↔ stdin, OUT/OUTC ↔ stdout, HALT ↔ process exit.
 ; ============================================================================
+
+; The three service entry points are global symbols so the phase-7
+; linker can resolve them across modules (docs/OBJECT_FORMAT.md).
+; In direct .bin assembly `.global` is accepted and ignored.
+    .global svc_exit
+    .global svc_write
+    .global svc_read
 
 ; ----------------------------------------------------------------------------
 ; svc_exit — terminate the guest via the runtime.

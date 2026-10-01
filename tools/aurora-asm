@@ -30,7 +30,7 @@ import os
 import re
 import sys
 
-ASM_VERSION = "1.0.0"
+ASM_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Bytecode constants (docs/BYTECODE.md, frozen v1)
@@ -54,6 +54,18 @@ UNUSED = 0xFF
 I32_MIN = -(2 ** 31)
 I32_MAX_U = 2 ** 32 - 1
 MEM_TOP = 0x10000
+
+# AURORA Object Format v1 (docs/OBJECT_FORMAT.md). All multi-byte
+# integers little-endian.
+OBJ_MAGIC = b"AURORAO1"          # 41 55 52 4F 52 41 4F 31
+OBJ_VERSION = 0x0001
+OBJ_HEADER_SIZE = 48
+SYM_ENTRY_SIZE = 76
+RELOC_ENTRY_SIZE = 12
+BIND_LOCAL, BIND_GLOBAL, BIND_UNDEF = 0, 1, 2
+SECT_CODE, SECT_DATA, SECT_NONE = 0, 1, 0xFF
+RELOC_CODE32, RELOC_ADDR32, RELOC_MEM32 = 1, 2, 3
+MAX_SYM_NAME = 63  # significant characters (field is 64 bytes NUL-padded)
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +268,11 @@ def parse_operand(text, col, lineno):
     t = text.strip()
     if not t:
         raise AsmError(lineno, col, "syntax error", "empty operand")
-    # Register: anything starting with R/r is register-shaped; anything
-    # that is not exactly R0-R15 is an invalid register (R16, R99, R-1...).
+    # Register: anything starting with R/r is register-shaped. A pure
+    # numeric shape that is not exactly R0-R15 is an invalid register
+    # (R16, R99). An alphabetic shape that is a valid label name
+    # ("read_loop", "Reset") is not a register at all: treat it as a
+    # label reference. Anything else is an invalid register (R-1, ...).
     if t[0] in "Rr":
         m = re.fullmatch(r"[Rr]([0-9]+)", t)
         if m:
@@ -270,6 +285,8 @@ def parse_operand(text, col, lineno):
         if re.search(r"\s", t):
             raise AsmError(lineno, col, "syntax error",
                            "bad register operand %r (missing comma?)" % t)
+        if LABEL_RE.fullmatch(t):
+            return ("label", t)
         raise AsmError(lineno, col, "invalid register", repr(t))
     # Memory operand: [expr]
     if t.startswith("["):
@@ -287,6 +304,8 @@ def parse_operand(text, col, lineno):
                     raise AsmError(lineno, inner_col, "invalid register",
                                    repr(inner))
                 return ("memreg", int(m.group(1)))
+            if LABEL_RE.fullmatch(inner):
+                return ("memabs", ("label", inner))
             raise AsmError(lineno, inner_col, "syntax error",
                            "bad memory operand [%s]" % inner)
         if NUMBER_RE.fullmatch(inner):
@@ -322,14 +341,18 @@ DIRECTIVES = ("DB", "DW", "DD", "DQ")
 def parse_source(filename, text):
     """First pass over the source.
 
-    Returns (items, code_labels, data_labels, code_size) where items is a
-    list of ("instr", lineno, col, mnemonic, operands) and
-    ("data", lineno, col, directive, operands) in source order.
+    Returns (items, code_labels, data_labels, code_size, defined,
+    global_decls) where items is a list of ("instr", lineno, col,
+    mnemonic, operands) and ("data", lineno, col, directive, operands)
+    in source order; defined maps label names to (lineno, col) in
+    source-definition order; global_decls maps names declared with the
+    `.global` directive to (lineno, col).
     """
     items = []
     code_labels = {}
     data_labels = {}
     defined = {}  # name -> (lineno, col) for duplicate detection
+    global_decls = {}  # name -> (lineno, col) of `.global` directives
     pending = []  # labels waiting for the next item to fix their section
 
     def define_label(name, lineno, col):
@@ -379,6 +402,27 @@ def parse_source(filename, text):
         # Mnemonic or directive.
         if rest.startswith("."):
             d = rest.split()[0]
+            if d.upper() == ".GLOBAL":
+                # `.global name` marks a module-local label as a GLOBAL
+                # object symbol (docs/OBJECT_FORMAT.md section 4). It is
+                # accepted in both output modes; without `-c` it only
+                # validates the declaration.
+                operand = rest[len(d):].strip()
+                op_col = rest_col + (len(rest) - len(rest[len(d):].lstrip()))
+                if not operand:
+                    raise AsmError(lineno, op_col, "missing operand",
+                                   ".global expects a symbol name")
+                if not LABEL_RE.fullmatch(operand):
+                    raise AsmError(lineno, op_col, "invalid symbol name",
+                                   ".global expects a label name, got %r"
+                                   % operand)
+                if operand in global_decls:
+                    prev = global_decls[operand]
+                    raise AsmError(lineno, op_col, "duplicate .global",
+                                   "%r already declared global at line %d"
+                                   % (operand, prev[0]))
+                global_decls[operand] = (lineno, op_col)
+                continue
             raise AsmError(lineno, rest_col, "invalid directive", repr(d))
         mm = MNEMONIC_RE.match(rest)
         if not mm:
@@ -419,7 +463,7 @@ def parse_source(filename, text):
 
     # Labels dangling at end of file point at the end of the code section.
     flush_pending("code", pc)
-    return items, code_labels, data_labels, pc
+    return items, code_labels, data_labels, pc, defined, global_decls
 
 
 def data_size_of(directive, operands, lineno):
@@ -519,6 +563,98 @@ class Ctx:
             raise AsmError(lineno, op_col, "invalid jump target",
                            "0x%X is not an instruction boundary inside "
                            "the code section" % addr)
+        return addr
+
+
+class ObjCtx(Ctx):
+    """Label resolution context for `-c` (object emission).
+
+    Nothing is resolved to a final address: every symbolic reference
+    emits imm32 = 0 and records one relocation in `last_reloc`
+    (at most one per instruction — no AURORA instruction has two
+    label operands). Labels that are referenced but not defined become
+    UNDEFINED symbols instead of "undefined label" errors; the linker
+    resolves them. Numeric operands keep their values, except numeric
+    jump targets skip the `< code_size` check: the final code size is
+    only known at link time, and the linker validates every class-J
+    target in the final image.
+    """
+
+    def __init__(self, code_labels, data_labels, code_size, defined,
+                 global_decls):
+        super().__init__(code_labels, data_labels, code_size)
+        self.symbols = []    # [name, bind, sect, offset], emission order
+        self.sym_index = {}  # name -> index into symbols
+        self.last_reloc = None  # (reloc_type, sym_idx) of current instr
+        for name in defined:  # source-definition order (dict order)
+            lineno, col = defined[name]
+            if len(name) > MAX_SYM_NAME:
+                raise AsmError(lineno, col, "symbol name too long",
+                               "%r exceeds %d characters (object format "
+                               "limit)" % (name, MAX_SYM_NAME))
+            if name in code_labels:
+                sect, off = SECT_CODE, code_labels[name]
+            else:
+                sect, off = SECT_DATA, data_labels[name]
+            bind = BIND_GLOBAL if name in global_decls else BIND_LOCAL
+            self.sym_index[name] = len(self.symbols)
+            self.symbols.append([name, bind, sect, off])
+
+    def ref(self, name, lineno, col):
+        """Symbol index for a referenced label; creates UNDEFINED."""
+        if name in self.sym_index:
+            return self.sym_index[name]
+        if len(name) > MAX_SYM_NAME:
+            raise AsmError(lineno, col, "symbol name too long",
+                           "%r exceeds %d characters (object format "
+                           "limit)" % (name, MAX_SYM_NAME))
+        idx = len(self.symbols)
+        self.sym_index[name] = idx
+        self.symbols.append([name, BIND_UNDEF, SECT_NONE, 0])
+        return idx
+
+    def _record(self, reloc):
+        assert self.last_reloc is None, \
+            "internal error: two relocations in one instruction"
+        self.last_reloc = reloc
+
+    def data_addr(self, name, lineno, col):
+        idx = self.ref(name, lineno, col)
+        self._record((RELOC_ADDR32, idx))
+        return 0
+
+    def code_addr(self, name, lineno, col):
+        if name in self.data_labels:
+            raise AsmError(lineno, col, "jump to data label",
+                           "%r is a data label" % name)
+        idx = self.ref(name, lineno, col)
+        self._record((RELOC_CODE32, idx))
+        return 0
+
+    def abs_mem_addr(self, expr, lineno, col):
+        if expr[0] == "imm":
+            addr = expr[1]
+            if not (0 <= addr <= MEM_TOP - 8):
+                raise AsmError(lineno, col, "address out of range",
+                               "0x%X is not a valid 64-bit access address "
+                               "(loader requires addr <= 0x10000 - 8)"
+                               % addr)
+            return addr
+        idx = self.ref(expr[1], lineno, col)
+        self._record((RELOC_MEM32, idx))
+        return 0
+
+    def jump_target(self, op, op_text, op_col, lineno):
+        if op[0] == "label":
+            return self.code_addr(op[1], lineno, op_col)
+        if op[0] == "imm":
+            addr = op[1]
+        else:
+            raise AsmError(lineno, op_col, "invalid operand",
+                           "expected code label or address, got %r" % op_text)
+        if not (0 <= addr and addr % 8 == 0):
+            raise AsmError(lineno, op_col, "invalid jump target",
+                           "0x%X is not an instruction boundary" % addr)
         return addr
 
 
@@ -688,7 +824,8 @@ def encode_data(directive, operands, lineno):
 
 def assemble_source(filename, text):
     """Assemble source text. Returns the complete bytecode file bytes."""
-    items, code_labels, data_labels, code_size = parse_source(filename, text)
+    items, code_labels, data_labels, code_size, _defined, _globals = \
+        parse_source(filename, text)
 
     code_items = [it for it in items if it[0] == "instr"]
     if not code_items:
@@ -724,7 +861,98 @@ def assemble_source(filename, text):
     return bytes(header) + bytes(code) + bytes(data)
 
 
-def assemble_file(input_path):
+def emit_object(code, data, symbols, relocs):
+    """Pack code/data/symbol/relocation tables into Object Format v1.
+
+    `symbols` is a list of (name, bind, sect, offset); `relocs` a list
+    of (reloc_type, code_offset, sym_idx). Layout: header, .code,
+    .data, symbol table, relocation table (docs/OBJECT_FORMAT.md).
+    """
+    code_off = OBJ_HEADER_SIZE
+    data_off = code_off + len(code)
+    sym_off = data_off + len(data)
+    rel_off = sym_off + len(symbols) * SYM_ENTRY_SIZE
+
+    hdr = bytearray()
+    hdr += OBJ_MAGIC
+    hdr += OBJ_VERSION.to_bytes(2, "little")
+    hdr += OBJ_HEADER_SIZE.to_bytes(2, "little")
+    hdr += (0).to_bytes(4, "little")                  # flags (reserved)
+    hdr += len(code).to_bytes(4, "little")
+    hdr += code_off.to_bytes(4, "little")
+    hdr += len(data).to_bytes(4, "little")
+    hdr += data_off.to_bytes(4, "little")
+    hdr += len(symbols).to_bytes(4, "little")
+    hdr += sym_off.to_bytes(4, "little")
+    hdr += len(relocs).to_bytes(4, "little")
+    hdr += rel_off.to_bytes(4, "little")
+    assert len(hdr) == OBJ_HEADER_SIZE
+
+    out = bytearray(hdr) + code + data
+    for (name, bind, sect, offset) in symbols:
+        raw = name.encode("ascii")  # LABEL_RE is ASCII-only
+        entry = bytearray(raw)
+        entry += b"\x00" * (64 - len(raw))            # NUL-pad
+        entry.append(bind)
+        entry.append(sect)
+        entry += (0).to_bytes(2, "little")            # reserved
+        entry += offset.to_bytes(4, "little")
+        entry += (0).to_bytes(4, "little")            # reserved
+        assert len(entry) == SYM_ENTRY_SIZE
+        out += entry
+    for (rtype, offset, sym_idx) in relocs:
+        entry = bytearray()
+        entry.append(rtype)
+        entry.append(0)                               # reserved
+        entry += (0).to_bytes(2, "little")            # reserved
+        entry += offset.to_bytes(4, "little")
+        entry += sym_idx.to_bytes(4, "little")
+        assert len(entry) == RELOC_ENTRY_SIZE
+        out += entry
+    return bytes(out)
+
+
+def assemble_object(filename, text):
+    """Assemble source text into an AURORA Object Format v1 file."""
+    items, code_labels, data_labels, code_size, defined, global_decls = \
+        parse_source(filename, text)
+
+    # `.global` must name a label defined in this module.
+    for name, (lineno, col) in global_decls.items():
+        if name not in code_labels and name not in data_labels:
+            raise AsmError(lineno, col, "undefined global",
+                           ".global %r is never defined in this module"
+                           % name)
+
+    ctx = ObjCtx(code_labels, data_labels, code_size, defined,
+                 global_decls)
+    code = bytearray()
+    relocs = []  # (reloc_type, code_offset, sym_idx), in code order
+    for (_k, lineno, col, mnemonic, operands, word) in \
+            [it for it in items if it[0] == "instr"]:
+        ctx.last_reloc = None
+        opcode, cls, dst, src, imm = encode_instr(mnemonic, word, operands,
+                                                  lineno, col, ctx)
+        if ctx.last_reloc is not None:
+            rtype, sym_idx = ctx.last_reloc
+            relocs.append((rtype, len(code) + 4, sym_idx))
+        code += bytes((opcode, dst, src, cls))
+        code += imm.to_bytes(4, "little")
+
+    data = bytearray()
+    for (_k, lineno, _col, directive, operands) in \
+            [it for it in items if it[0] == "data"]:
+        data += encode_data(directive, operands, lineno)
+
+    if len(code) + len(data) > MAX_CODE_DATA:
+        raise AsmError(1, 1, "program too large",
+                       "code+data is 0x%X bytes, limit is 0x%X"
+                       % (len(code) + len(data), MAX_CODE_DATA))
+
+    return emit_object(bytes(code), bytes(data), ctx.symbols, relocs)
+
+
+def assemble_file(input_path, mode="bin"):
     try:
         with open(input_path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -735,7 +963,10 @@ def assemble_file(input_path):
     except UnicodeDecodeError:
         return (2, "aurora-asm: %r is not valid UTF-8 text" % input_path)
     try:
-        blob = assemble_source(input_path, text)
+        if mode == "obj":
+            blob = assemble_object(input_path, text)
+        else:
+            blob = assemble_source(input_path, text)
     except AsmError as e:
         return (1, "aurora-asm: " + e.render(input_path))
     return (0, blob)
@@ -747,13 +978,22 @@ def assemble_file(input_path):
 
 HELP = """\
 usage: aurora-asm [options] input.asm [-o output.bin]
+       aurora-asm -c [options] input.asm [-o output.o]
 
-Assemble AURORA Assembly language into v1 bytecode (docs/BYTECODE.md).
+Assemble AURORA Assembly language into v1 bytecode (docs/BYTECODE.md),
+or with -c into a relocatable AURORA Object Format v1 file
+(docs/OBJECT_FORMAT.md) for the static linker tools/aurora-ld.
 
 options:
-  -o FILE        write bytecode to FILE (default: input with .bin suffix)
+  -c, --compile  emit an object file (.o) instead of a bytecode executable
+  -o FILE        write output to FILE (default: input with .bin suffix,
+                 or .o suffix with -c)
   --help         show this help and exit
   --version      show the assembler version and exit
+
+Directives: .global NAME marks a label as a global (linker-visible)
+object symbol. It is accepted in both modes; it only takes effect
+when emitting an object file with -c.
 
 Exit codes: 0 = success, 1 = assembly error, 2 = usage/file error.
 
@@ -761,17 +1001,19 @@ Language reference: docs/ASSEMBLER.md. The ISA authority is docs/ISA.md.
 """
 
 
-def default_output(input_path):
+def default_output(input_path, obj=False):
+    suffix = ".o" if obj else ".bin"
     base, ext = os.path.splitext(input_path)
     if ext.lower() == ".asm":
-        return base + ".bin"
-    return input_path + ".bin"
+        return base + suffix
+    return input_path + suffix
 
 
 def main(argv):
     args = list(argv[1:])
     out_path = None
     input_path = None
+    obj_mode = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -781,6 +1023,10 @@ def main(argv):
         if a == "--version":
             sys.stdout.write("aurora-asm %s (bytecode v1)\n" % ASM_VERSION)
             return 0
+        if a in ("-c", "--compile"):
+            obj_mode = True
+            i += 1
+            continue
         if a == "-o":
             if i + 1 >= len(args):
                 sys.stderr.write("aurora-asm: -o requires a file argument\n")
@@ -801,12 +1047,13 @@ def main(argv):
         sys.stderr.write("aurora-asm: missing input file\n%s" % HELP)
         return 2
     if out_path is None:
-        out_path = default_output(input_path)
+        out_path = default_output(input_path, obj_mode)
     if os.path.abspath(input_path) == os.path.abspath(out_path):
         sys.stderr.write("aurora-asm: input and output are the same file\n")
         return 2
 
-    code, result = assemble_file(input_path)
+    code, result = assemble_file(input_path,
+                                 "obj" if obj_mode else "bin")
     if code != 0:
         sys.stderr.write(result + "\n")
         return code

@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""aurora-ld: static linker for the AURORA VM.
+
+Links AURORA Object Format v1 files (docs/OBJECT_FORMAT.md) into an
+AURORA executable bytecode v1 file (docs/BYTECODE.md):
+
+    aurora-ld main.o math.o runtime.o -o program.bin
+
+The linker is a host tool: it knows symbols and relocations only. It
+knows nothing about CPU semantics, and nothing special about `svc_*`
+(D26: the runtime links as an ordinary module). The output is plain
+bytecode v1 with entry = 0; the first object on the link line provides
+the entry code (docs/LINKER.md).
+
+Exit codes: 0 = success, 1 = link error, 2 = CLI/file error.
+"""
+
+import os
+import struct
+import sys
+
+LD_VERSION = "1.0.0"
+
+# --- AURORA Object Format v1 (docs/OBJECT_FORMAT.md) -----------------------
+OBJ_MAGIC = b"AURORAO1"
+OBJ_VERSION = 0x0001
+OBJ_HEADER_SIZE = 48
+SYM_ENTRY_SIZE = 76
+RELOC_ENTRY_SIZE = 12
+BIND_LOCAL, BIND_GLOBAL, BIND_UNDEF = 0, 1, 2
+SECT_CODE, SECT_DATA, SECT_NONE = 0, 1, 0xFF
+RELOC_CODE32, RELOC_ADDR32, RELOC_MEM32 = 1, 2, 3
+MAX_SYM_NAME = 63
+
+# --- Executable bytecode v1 (docs/BYTECODE.md) ------------------------------
+EXE_MAGIC = bytes((0x41, 0x55, 0x52, 0x4F, 0x52, 0x41, 0x01, 0x00))
+EXE_VERSION = 0x0001
+CLS_J = 0x05
+
+# --- Guest memory limits (docs/BYTECODE.md section 5) ----------------------
+MAX_CODE_DATA = 0xF000  # code+data must not reach the stack
+MEM_TOP = 0x10000
+
+
+class LinkError(Exception):
+    """A link/semantic error (exit 1). Message is user-facing."""
+
+
+# ---------------------------------------------------------------------------
+# Object parsing and validation (docs/OBJECT_FORMAT.md sections 3-5)
+# ---------------------------------------------------------------------------
+
+def _check(cond, what):
+    if not cond:
+        raise LinkError(what)
+
+
+def _region_ok(off, size, filesize, what):
+    # Overflow-safe bounds check: off + size <= filesize.
+    _check(size <= filesize and off <= filesize - size,
+           "%s out of bounds (offset=%d size=%d filesize=%d)"
+           % (what, off, size, filesize))
+
+
+def _parse_name(raw, idx):
+    # 64 bytes, NUL-terminated, NUL-padded, [A-Za-z_][A-Za-z0-9_]*,
+    # 1..63 significant characters.
+    _check(b"\x00" in raw, "symbol %d: name is not NUL-terminated" % idx)
+    name = raw.split(b"\x00", 1)[0]
+    _check(1 <= len(name) <= MAX_SYM_NAME,
+           "symbol %d: bad name length %d" % (idx, len(name)))
+    _check(raw[len(name):] == b"\x00" * (64 - len(name)),
+           "symbol %d: name padding is not zero" % idx)
+    try:
+        text = name.decode("ascii")
+    except UnicodeDecodeError:
+        raise LinkError("symbol %d: name is not ASCII" % idx)
+    _check(text[0].isalpha() or text[0] == "_",
+           "symbol %d: bad name %r" % (idx, text))
+    _check(all(c.isalnum() or c == "_" for c in text),
+           "symbol %d: bad name %r" % (idx, text))
+    return text
+
+
+def parse_object(path, data):
+    """Parse and strictly validate one object file.
+
+    Returns a dict with code, data, symbols, relocs. Raises LinkError
+    on any structural violation; the linker never trusts an object.
+    """
+    tag = "object %r" % path
+    _check(len(data) >= OBJ_HEADER_SIZE,
+           "%s: truncated header (%d bytes)" % (tag, len(data)))
+    (magic, version, hsize, flags,
+     code_size, code_off, data_size, data_off,
+     sym_count, sym_off, reloc_count, reloc_off) = \
+        struct.unpack("<8sHHI8I", data[:OBJ_HEADER_SIZE])
+
+    _check(magic == OBJ_MAGIC,
+           "%s: bad magic %r" % (tag, magic))
+    _check(version == OBJ_VERSION,
+           "%s: unsupported version %d" % (tag, version))
+    _check(hsize == OBJ_HEADER_SIZE,
+           "%s: bad header_size %d" % (tag, hsize))
+    _check(flags == 0, "%s: nonzero flags" % tag)
+    _check(code_size % 8 == 0,
+           "%s: code_size %d is not a multiple of 8" % (tag, code_size))
+    _check(code_size + data_size <= MAX_CODE_DATA,
+           "%s: code+data 0x%X exceeds 0x%X"
+           % (tag, code_size + data_size, MAX_CODE_DATA))
+
+    sym_size = sym_count * SYM_ENTRY_SIZE
+    reloc_size = reloc_count * RELOC_ENTRY_SIZE
+    regions = [("header", 0, OBJ_HEADER_SIZE),
+               ("code section", code_off, code_size),
+               ("data section", data_off, data_size),
+               ("symbol table", sym_off, sym_size),
+               ("relocation table", reloc_off, reloc_size)]
+    for (what, off, size) in regions:
+        _region_ok(off, size, len(data), "%s: %s" % (tag, what))
+    # Pairwise overlap (zero-size regions occupy nothing).
+    for i in range(len(regions)):
+        for j in range(i + 1, len(regions)):
+            (wa, oa, sa) = regions[i][0], regions[i][1], regions[i][2]
+            (wb, ob, sb) = regions[j][0], regions[j][1], regions[j][2]
+            if sa > 0 and sb > 0 and oa < ob + sb and ob < oa + sa:
+                raise LinkError("%s: %s overlaps %s" % (tag, wa, wb))
+
+    code = data[code_off:code_off + code_size]
+    data_seg = data[data_off:data_off + data_size]
+
+    symbols = []
+    seen = set()
+    for i in range(sym_count):
+        base = sym_off + i * SYM_ENTRY_SIZE
+        raw = data[base:base + 64]
+        bind, sect, res1, offset, res2 = \
+            struct.unpack("<BBHII", data[base + 64:base + SYM_ENTRY_SIZE])
+        name = _parse_name(raw, i)
+        _check(name not in seen,
+               "%s: duplicate symbol %r" % (tag, name))
+        seen.add(name)
+        _check(bind in (BIND_LOCAL, BIND_GLOBAL, BIND_UNDEF),
+               "%s: symbol %r has bad binding %d" % (tag, name, bind))
+        _check(sect in (SECT_CODE, SECT_DATA, SECT_NONE),
+               "%s: symbol %r has bad section %d" % (tag, name, sect))
+        _check(res1 == 0 and res2 == 0,
+               "%s: symbol %r has nonzero reserved fields" % (tag, name))
+        if bind == BIND_UNDEF:
+            _check(sect == SECT_NONE and offset == 0,
+                   "%s: undefined symbol %r must have section NONE and "
+                   "offset 0" % (tag, name))
+        elif sect == SECT_CODE:
+            _check(offset < code_size and offset % 8 == 0,
+                   "%s: symbol %r has bad code offset %d"
+                   % (tag, name, offset))
+        elif sect == SECT_DATA:
+            _check(offset < data_size,
+                   "%s: symbol %r has bad data offset %d"
+                   % (tag, name, offset))
+        else:
+            raise LinkError("%s: defined symbol %r has section NONE"
+                            % (tag, name))
+        symbols.append({"name": name, "bind": bind, "sect": sect,
+                        "offset": offset})
+
+    relocs = []
+    patch_offsets = set()
+    for i in range(reloc_count):
+        base = reloc_off + i * RELOC_ENTRY_SIZE
+        rtype, res1, res2, offset, sym_idx = \
+            struct.unpack("<BBHII", data[base:base + RELOC_ENTRY_SIZE])
+        _check(rtype in (RELOC_CODE32, RELOC_ADDR32, RELOC_MEM32),
+               "%s: relocation %d has unknown type %d" % (tag, i, rtype))
+        _check(res1 == 0 and res2 == 0,
+               "%s: relocation %d has nonzero reserved fields" % (tag, i))
+        _check(sym_idx < sym_count,
+               "%s: relocation %d references nonexistent symbol %d"
+               % (tag, i, sym_idx))
+        _check(offset < code_size and offset % 8 == 4,
+               "%s: relocation %d has bad code offset %d"
+               % (tag, i, offset))
+        _check(offset not in patch_offsets,
+               "%s: relocation %d patches the same field as another "
+               "relocation (offset %d)" % (tag, i, offset))
+        patch_offsets.add(offset)
+        relocs.append({"type": rtype, "offset": offset, "sym": sym_idx})
+
+    return {"path": path, "code": code, "data": data_seg,
+            "symbols": symbols, "relocs": relocs}
+
+
+# ---------------------------------------------------------------------------
+# Linking (docs/LINKER.md sections 2-5)
+# ---------------------------------------------------------------------------
+
+def resolve_symbols(objs):
+    """Build the global symbol table. Returns name -> (obj_idx, sym_idx).
+
+    Duplicate globals and dangling undefined symbols are link errors.
+    """
+    defined = {}
+    for oi, obj in enumerate(objs):
+        for si, sym in enumerate(obj["symbols"]):
+            if sym["bind"] != BIND_GLOBAL:
+                continue
+            name = sym["name"]
+            if name in defined:
+                first = objs[defined[name][0]]["path"]
+                raise LinkError(
+                    "duplicate global symbol %r: first defined in %r, "
+                    "redefined in %r" % (name, first, obj["path"]))
+            defined[name] = (oi, si)
+    for obj in objs:
+        for sym in obj["symbols"]:
+            if sym["bind"] == BIND_UNDEF and sym["name"] not in defined:
+                raise LinkError(
+                    "undefined symbol %r: referenced by %r"
+                    % (sym["name"], obj["path"]))
+    return defined
+
+
+def compute_layout(objs):
+    """Final [code][data] layout in link order (docs/LINKER.md section 4)."""
+    code_bases, data_bases = [], []
+    total_code = 0
+    for obj in objs:
+        code_bases.append(total_code)
+        total_code += len(obj["code"])
+    total_data = 0
+    for obj in objs:
+        data_bases.append(total_code + total_data)
+        total_data += len(obj["data"])
+    _check(total_code > 0, "link resulted in an empty code section")
+    _check(total_code + total_data <= MAX_CODE_DATA,
+           "linked code+data is 0x%X bytes, limit is 0x%X"
+           % (total_code + total_data, MAX_CODE_DATA))
+    # Wraparound-safe: every end address must stay inside 64 KiB.
+    for b, obj in zip(code_bases, objs):
+        _check(b + len(obj["code"]) < MEM_TOP, "code address overflow")
+    for b, obj in zip(data_bases, objs):
+        _check(b + len(obj["data"]) < MEM_TOP, "data address overflow")
+    return code_bases, data_bases, total_code, total_data
+
+
+def symbol_address(sym, def_obj, code_bases, data_bases):
+    if sym["sect"] == SECT_CODE:
+        return code_bases[def_obj] + sym["offset"]
+    if sym["sect"] == SECT_DATA:
+        return data_bases[def_obj] + sym["offset"]
+    raise LinkError("internal error: relocation against section NONE")
+
+
+def apply_relocations(objs, defined, code_bases, data_bases,
+                       total_code, image):
+    """Patch every relocation site (docs/OBJECT_FORMAT.md section 5)."""
+    for oi, obj in enumerate(objs):
+        for rel in obj["relocs"]:
+            sym = obj["symbols"][rel["sym"]]
+            if sym["bind"] == BIND_UNDEF:
+                def_obj, def_sym = defined[sym["name"]]
+                dsym = objs[def_obj]["symbols"][def_sym]
+            else:
+                def_obj, dsym = oi, sym
+            s = symbol_address(dsym, def_obj, code_bases, data_bases)
+            rtype = rel["type"]
+            if rtype == RELOC_CODE32:
+                if dsym["sect"] != SECT_CODE:
+                    raise LinkError(
+                        "relocation error in %r: CODE32 relocation against "
+                        "non-code symbol %r" % (obj["path"], dsym["name"]))
+                if not (s < total_code and s % 8 == 0):
+                    raise LinkError(
+                        "relocation error in %r: code address 0x%X of %r "
+                        "is not an instruction boundary" % (obj["path"], s,
+                                                             dsym["name"]))
+            elif rtype == RELOC_ADDR32:
+                if not (0 <= s <= 0xFFFFFFFF):
+                    raise LinkError(
+                        "relocation error in %r: address 0x%X of %r does "
+                        "not fit in 32 bits" % (obj["path"], s, dsym["name"]))
+            elif rtype == RELOC_MEM32:
+                if not (0 <= s <= MEM_TOP - 8):
+                    raise LinkError(
+                        "relocation error in %r: address 0x%X of %r is not "
+                        "a valid 64-bit access address (must be "
+                        "<= 0x10000 - 8)" % (obj["path"], s, dsym["name"]))
+            else:  # unreachable: validated at parse time
+                raise LinkError("internal error: bad relocation type")
+            at = code_bases[oi] + rel["offset"]
+            image[at:at + 4] = s.to_bytes(4, "little")
+
+
+def validate_jump_targets(image, total_code):
+    """Every class-J target in the final image must satisfy the loader's
+    own rule (target < code_size, 8-aligned); the linker never emits a
+    .bin the loader would reject."""
+    for off in range(0, total_code, 8):
+        cls = image[off + 3]
+        if cls != CLS_J:
+            continue
+        target = int.from_bytes(image[off + 4:off + 8], "little")
+        if not (target < total_code and target % 8 == 0):
+            raise LinkError(
+                "invalid jump target 0x%X at code offset 0x%X "
+                "(not an instruction boundary inside the code section)"
+                % (target, off))
+
+
+def emit_executable(code, data):
+    """Wrap linked code+data in the executable v1 header (entry = 0)."""
+    hdr = bytearray()
+    hdr += EXE_MAGIC
+    hdr += EXE_VERSION.to_bytes(2, "little")
+    hdr += len(code).to_bytes(4, "little")
+    hdr += (0).to_bytes(4, "little")          # entry: first instruction
+    hdr += len(data).to_bytes(4, "little")
+    hdr += (0).to_bytes(4, "little")          # reserved
+    assert len(hdr) == 26
+    return bytes(hdr) + bytes(code) + bytes(data)
+
+
+def link(objs):
+    """Link validated objects into executable bytecode v1 bytes."""
+    defined = resolve_symbols(objs)
+    code_bases, data_bases, total_code, total_data = compute_layout(objs)
+    image = bytearray(total_code + total_data)
+    for oi, obj in enumerate(objs):
+        image[code_bases[oi]:code_bases[oi] + len(obj["code"])] = obj["code"]
+        image[data_bases[oi]:data_bases[oi] + len(obj["data"])] = obj["data"]
+    apply_relocations(objs, defined, code_bases, data_bases,
+                      total_code, image)
+    validate_jump_targets(image, total_code)
+    return emit_executable(bytes(image[:total_code]),
+                           bytes(image[total_code:]))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """\
+usage: aurora-ld [options] input.o [...] [-o output.bin]
+
+Statically link AURORA Object Format v1 files (docs/OBJECT_FORMAT.md)
+into an executable bytecode v1 file (docs/BYTECODE.md).
+
+Link order is significant: objects are laid out [code][data] in the
+order given, and the first object provides the entry code (entry = 0).
+
+options:
+  -o FILE        write the linked executable to FILE (default: first
+                 input with .bin suffix)
+  --help         show this help and exit
+  --version      show the linker version and exit
+
+Exit codes: 0 = success, 1 = link error, 2 = CLI/file error.
+
+Linker reference: docs/LINKER.md.
+"""
+
+
+def default_output(input_path):
+    base, ext = os.path.splitext(input_path)
+    if ext.lower() == ".o":
+        return base + ".bin"
+    return input_path + ".bin"
+
+
+def read_object(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return (2, "aurora-ld: cannot open %r: no such file" % path)
+    except OSError as e:
+        return (2, "aurora-ld: cannot read %r: %s" % (path, e))
+    try:
+        return (0, parse_object(path, data))
+    except LinkError as e:
+        return (1, "aurora-ld: error: %s" % e)
+
+
+def main(argv):
+    args = list(argv[1:])
+    out_path = None
+    inputs = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--help", "-h"):
+            sys.stdout.write(HELP)
+            return 0
+        if a == "--version":
+            sys.stdout.write("aurora-ld %s (object format v1)\n" % LD_VERSION)
+            return 0
+        if a == "-o":
+            if i + 1 >= len(args):
+                sys.stderr.write("aurora-ld: -o requires a file argument\n")
+                return 2
+            if out_path is not None:
+                sys.stderr.write("aurora-ld: multiple -o options\n")
+                return 2
+            out_path = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("-"):
+            sys.stderr.write("aurora-ld: unknown option %r\n" % a)
+            return 2
+        inputs.append(a)
+        i += 1
+
+    if not inputs:
+        sys.stderr.write("aurora-ld: missing input files\n%s" % HELP)
+        return 2
+    if out_path is None:
+        out_path = default_output(inputs[0])
+    for p in inputs:
+        if os.path.abspath(p) == os.path.abspath(out_path):
+            sys.stderr.write("aurora-ld: input and output are the same "
+                             "file: %r\n" % p)
+            return 2
+
+    objs = []
+    for path in inputs:
+        code, result = read_object(path)
+        if code != 0:
+            sys.stderr.write(result + "\n")
+            return code
+        objs.append(result)
+
+    try:
+        blob = link(objs)
+    except LinkError as e:
+        sys.stderr.write("aurora-ld: error: %s\n" % e)
+        return 1
+
+    try:
+        with open(out_path, "wb") as f:
+            f.write(blob)
+    except OSError as e:
+        sys.stderr.write("aurora-ld: cannot write %r: %s\n" % (out_path, e))
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except LinkError as e:  # should never escape link()
+        sys.stderr.write("aurora-ld: internal error: %s\n" % e)
+        sys.exit(3)

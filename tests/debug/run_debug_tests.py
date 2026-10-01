@@ -122,6 +122,13 @@ out, err, rc = dbg(SIMPLE, ["memory 0x10000 16", "quit"])
 check("memory out of range", "error" in out.lower())
 out, err, rc = dbg(SIMPLE, ["memory 0xFFFFF 16", "quit"])
 check("memory huge addr rejected", "error" in out.lower())
+# regression (phase 7): count not a multiple of 16 must terminate, not hang
+out, err, rc = dbg(SIMPLE, ["memory 0x0 8", "quit"])
+check("memory count 8 terminates", rc == 0 and "0x00000000:" in out, out[:120])
+check("memory count 8 prints one row", out.count("0x000000") == 1, out[:200])
+out, err, rc = dbg(SIMPLE, ["memory 0x0 20", "quit"])
+check("memory count 20 terminates", rc == 0, out[:120])
+check("memory count 20 prints two rows", out.count("0x000000") == 2, out[:200])
 
 print("== stack/backtrace ==")
 out, err, rc = dbg(SIMPLE, ["stack", "quit"])

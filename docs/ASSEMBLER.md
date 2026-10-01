@@ -16,6 +16,7 @@ aurora-asm [options] input.asm [-o output.bin]
 | Option | Meaning |
 |--------|---------|
 | `-o FILE` | write bytecode to FILE (default: input path with `.bin` suffix) |
+| `-c` / `--compile` | emit a relocatable object (`.o`, phase 7) instead of bytecode |
 | `--help` | print help and exit (exit 0) |
 | `--version` | print `aurora-asm <ver> (bytecode v1)` and exit (exit 0) |
 
@@ -238,6 +239,35 @@ The output is exactly the v1 container from `docs/BYTECODE.md`:
 Assembly is **deterministic**: the same `.asm` always produces
 byte-identical `.bin` (no timestamps, no absolute paths, no hash-order
 dependence).
+
+---
+
+## 6b. Object emission (`-c`, phase 7)
+
+With `-c` (or `--compile`) the assembler emits a relocatable AURORA
+object (`.o`, `docs/OBJECT_FORMAT.md`) instead of an executable:
+
+- Labels used by `CALL`/`JMP`/Jcc, `MOV Rd,label` and
+  `LOAD`/`STORE [label]` become relocations (`CODE32`/`ADDR32`/`MEM32`);
+  numeric operands and data directives never do.
+- `.global NAME` declares a symbol `GLOBAL` (exported); any other
+  label stays `LOCAL`. References to names that are not defined in the
+  file are recorded as `UNDEFINED` imports (not an error).
+- Direct `.asm → .bin` assembly is unchanged and byte-identical;
+  linking `.o` files with `tools/aurora-ld` produces exactly bytecode
+  v1. Normative details: `docs/OBJECT_FORMAT.md`, `docs/LINKER.md`.
+
+```asm
+; lib.asm
+.global add42
+add42:
+    ADD R0, R1
+    RET
+```
+```bash
+$ python3 tools/aurora-asm -c lib.asm -o lib.o
+$ python3 tools/aurora-ld main.o lib.o -o prog.bin
+```
 
 ---
 

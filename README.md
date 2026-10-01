@@ -166,13 +166,33 @@ Full normative specification: [`docs/BYTECODE.md`](docs/BYTECODE.md).
 
 `runtime/aurora_rt.asm` (phase 6) — a guest-side service library in AURORA
 assembly (frozen ISA, no traps): `svc_exit`, `svc_write`, `svc_read`.
-Guest programs link it by concatenation and `CALL` the entry points;
-arguments in R0–R2, return in R0, R3–R15/SP/FP preserved.
+Guest programs link it as an ordinary object module with `aurora-ld`
+(phase 7) and `CALL` the entry points; arguments in R0–R2, return in
+R0, R3–R15/SP/FP preserved.
 Full contract: [`docs/RUNTIME.md`](docs/RUNTIME.md).
+
+## Linker
+
+`tools/aurora-ld` (phase 7) — static linker for the AURORA object
+format (`.o`): resolves `LOCAL` / `GLOBAL` / `UNDEFINED` symbols,
+concatenates code and data segments in link order, and applies
+`CODE32` / `ADDR32` / `MEM32` relocations to emit an executable
+bytecode v1 file. The assembler emits objects with `-c`; multi-module
+example in `examples/linker/`.
+
+```bash
+python3 tools/aurora-asm -c main.asm -o main.o
+python3 tools/aurora-asm -c lib.asm  -o lib.o
+python3 tools/aurora-ld main.o lib.o -o prog.bin
+./build/aurora run prog.bin
+```
+
+Full specification: [`docs/OBJECT_FORMAT.md`](docs/OBJECT_FORMAT.md),
+[`docs/LINKER.md`](docs/LINKER.md).
 
 ## Testing
 
-Eight layers ([`docs/TESTING.md`](docs/TESTING.md)):
+Nine layers ([`docs/TESTING.md`](docs/TESTING.md)):
 
 ```text
 L1 Golden Vectors        byte-exact vectors, assembler-independent (normative)
@@ -183,6 +203,7 @@ L5 Fuzzing               mutational bytecode fuzzing, no hangs/crashes
 L6 Determinism           repeated runs are bit-identical
 L7 Debugger              scripted interactive sessions
 L8 Runtime ABI           service contract, memory safety, golden fixtures
+L9 Linker                object format, symbols, relocations, multi-module runs
 ```
 
 ## Build
@@ -201,9 +222,9 @@ Produces the static binary `build/aurora` (no libc).
 make test
 ```
 
-Runs the phase test suites (`make test`): L1–L4, L6, L7, L8 — all green
-(CLI, bytecode, opcode audit, CPU, termination, assembler, debugger,
-runtime ABI).
+Runs the phase test suites (`make test`): L1–L4, L6, L7, L8, L9 — all
+green (CLI, bytecode, opcode audit, CPU, termination, assembler,
+debugger, runtime ABI, linker).
 
 ## Fuzzing
 
@@ -226,7 +247,9 @@ aurora-vm/
 │   ├── run.asm     # `aurora run`
 │   ├── debug.asm   # `aurora debug`
 │   └── loader.asm  # bytecode loader (phase 2)
-├── tools/          # assembler — Python 3 stdlib only (phase 4)
+├── tools/          # assembler + linker — Python 3 stdlib only
+│   ├── aurora-asm  # (phase 4, extended phase 7: -c object emission)
+│   └── aurora-ld   # static linker (phase 7)
 ├── runtime/        # ABI v1 guest-side library (phase 6)
 ├── programs/       # sample AURORA programs (phase 4)
 ├── tests/          # test suites per phase + golden vectors
@@ -236,8 +259,13 @@ aurora-vm/
 │   ├── BYTECODE.md
 │   ├── DECISIONS.md
 │   ├── TESTING.md
-│   └── RUNTIME.md
+│   ├── ASSEMBLER.md
+│   ├── DEBUGGER.md
+│   ├── RUNTIME.md
+│   ├── OBJECT_FORMAT.md
+│   └── LINKER.md
 ├── examples/       # illustrative AURORA Assembly sources
+│   └── linker/     # multi-module examples (phase 7)
 └── Makefile
 ```
 
@@ -250,10 +278,14 @@ aurora-vm/
 - [`docs/BYTECODE.md`](docs/BYTECODE.md) — **normative** file format and
   loader validation rules
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — architectural decision log
-  (D01–D26)
-- [`docs/TESTING.md`](docs/TESTING.md) — the 8 test layers
+  (D01–D27)
+- [`docs/TESTING.md`](docs/TESTING.md) — the 9 test layers
 - [`docs/RUNTIME.md`](docs/RUNTIME.md) — **normative** runtime ABI v1:
   services, argument/return conventions, memory safety
+- [`docs/OBJECT_FORMAT.md`](docs/OBJECT_FORMAT.md) — **normative** AURORA
+  object format v1 (`.o`): header, sections, symbols, relocations
+- [`docs/LINKER.md`](docs/LINKER.md) — **normative** static linker:
+  resolution, layout, entry policy, errors
 
 ## Status
 
@@ -266,7 +298,7 @@ aurora-vm/
 | 4 | Assembler (Python 3 stdlib) + sample programs | ✅ done |
 | 5 | Interactive debugger | ✅ done |
 | 6 | Runtime ABI & services (guest-side library, D26) | ✅ done |
-| 7 | Fib(30) stress + full program suite | ⬜ planned |
+| 7 | Linker & object format (static linking, D27) | ✅ done |
 | 8 | Full suite + fuzzing + final docs | ⬜ planned |
 
 Only phases marked ✅ are implemented. Nothing above is presented as working
