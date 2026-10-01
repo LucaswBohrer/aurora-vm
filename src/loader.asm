@@ -21,6 +21,7 @@ default rel
 global loader_load_file
 global vm_regs
 global vm_mem
+global vm_code_size
 
 extern fatal_error
 extern host_open_error
@@ -41,6 +42,7 @@ extern cstr_len
 section .bss
 vm_regs:    resb VM_REGS_SIZE
 vm_mem:     resb VM_MEM_SIZE
+vm_code_size: resq 1                ; code segment size, set by the loader
 file_buf:   resb FILE_BUF_SIZE
 detail_buf: resb 256
 
@@ -302,13 +304,30 @@ loader_load_file:
     jne .bad_reg
     jmp .next_slot                  ; any imm32 pattern accepted
 
-.cls_lr:                            ; single register: dst unused, src register
+.cls_lr:                            ; single register: field placement is per-opcode
+    ; (ISA.md §6: Rd-named operand -> dst, Rs-named operand -> src).
+    ; Dst-register opcodes: INC 0x0C, DEC 0x0D, NOT 0x14, POP 0x1E, IN 0x2A.
+    ; Src-register opcodes: PUSH 0x1D, OUT 0x28, OUTC 0x29.
+    ; The class table above guarantees only these 8 opcodes reach here.
+    test r8, r8
+    jnz .bad_imm
+    cmp eax, 0x1D                   ; PUSH Rs
+    je .lr_src_reg
+    cmp eax, 0x28                   ; OUT Rs
+    je .lr_src_reg
+    cmp eax, 0x29                   ; OUTC Rs
+    je .lr_src_reg
+    ; default: dst holds the register, src unused
+    cmp esi, 0x0F
+    ja .bad_reg
+    cmp edi, 0xFF
+    jne .bad_reg
+    jmp .next_slot
+.lr_src_reg:                        ; dst unused, src holds the register
     cmp esi, 0xFF
     jne .bad_reg
     cmp edi, 0x0F
     ja .bad_reg
-    test r8, r8
-    jnz .bad_imm
     jmp .next_slot
 
 .cls_m:                             ; absolute address + register
@@ -376,6 +395,7 @@ loader_load_file:
     mov [vm_regs + VM_OFF_PC], r10
     mov qword [vm_regs + VM_OFF_SP], VM_INIT_SP
     mov qword [vm_regs + VM_OFF_FP], VM_INIT_SP
+    mov [vm_code_size], r14          ; publish code_size for the CPU's PC checks
 
     xor eax, eax                    ; return 0
     pop r15

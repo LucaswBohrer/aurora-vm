@@ -21,19 +21,9 @@ global host_open_error
 extern print_fd
 extern cstr_len
 
-; Error ids (match ARCHITECTURE.md §2.10 and ISA.md):
-%define ERR_INVALID_OPCODE        1
-%define ERR_INVALID_REGISTER     2
-%define ERR_INVALID_MEMORY_ACCESS 3
-%define ERR_STACK_OVERFLOW       4
-%define ERR_STACK_UNDERFLOW      5
-%define ERR_DIVISION_BY_ZERO     6
-%define ERR_INVALID_PC           7
-%define ERR_INVALID_PROGRAM      8
-%define ERR_INVALID_INSTRUCTION  9
-%define ERR_MAX_STEPS_EXCEEDED   10
-%define ERR_WRITE_TO_CODE        11
-%define ERR_IO_ERROR             12
+; Error ids (match ARCHITECTURE.md §2.10 and ISA.md).
+; Shared with cpu.asm via src/errids.inc (single source of truth).
+%include "src/errids.inc"
 
 section .rodata
 s_err_prefix: db "aurora: error: "

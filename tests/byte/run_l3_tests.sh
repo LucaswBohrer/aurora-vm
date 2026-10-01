@@ -28,13 +28,18 @@ while IFS="$(printf '\t')" read -r name exp_exit subs; do
     code=$?
     ok=1
     if [ "$code" -ne "$exp_exit" ]; then ok=0; fi
-    old_ifs="$IFS"; IFS='|'
-    # shellcheck disable=SC2086
-    set -- $subs
-    IFS="$old_ifs"
-    for sub in "$@"; do
-        if ! printf '%s' "$out" | grep -qF -- "$sub"; then ok=0; fi
-    done
+    if [ -z "$subs" ]; then
+        # empty substring field: assert empty stdout+stderr
+        if [ -n "$out" ]; then ok=0; fi
+    else
+        old_ifs="$IFS"; IFS='|'
+        # shellcheck disable=SC2086
+        set -- $subs
+        IFS="$old_ifs"
+        for sub in "$@"; do
+            if ! printf '%s' "$out" | grep -qF -- "$sub"; then ok=0; fi
+        done
+    fi
     if [ "$ok" -eq 1 ]; then
         PASS=$((PASS + 1)); printf 'PASS: %s\n' "$name"
     else

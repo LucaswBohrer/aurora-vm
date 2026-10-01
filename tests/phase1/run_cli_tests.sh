@@ -8,11 +8,17 @@ PASS=0
 FAIL=0
 
 # run_test <name> <expected_exit> <expected_substring> [args...]
+# An empty expected_substring asserts empty stdout+stderr.
 run_test() {
     name="$1"; exp_exit="$2"; exp_sub="$3"; shift 3
     out="$("$BIN" "$@" 2>&1)"
     code=$?
-    if [ "$code" -eq "$exp_exit" ] && printf '%s' "$out" | grep -qF -- "$exp_sub"; then
+    if [ -z "$exp_sub" ]; then
+        [ -z "$out" ] && out_ok=1 || out_ok=0
+    else
+        printf '%s' "$out" | grep -qF -- "$exp_sub" && out_ok=1 || out_ok=0
+    fi
+    if [ "$code" -eq "$exp_exit" ] && [ "$out_ok" -eq 1 ]; then
         PASS=$((PASS + 1))
         printf 'PASS: %s\n' "$name"
     else
@@ -51,12 +57,12 @@ run_test "version-short"        0 "aurora 1.0.0" -V
 run_test "no-args-shows-help"   0 "Usage:"
 run_test "run-missing-file"     2 "run: missing file operand" run
 run_test "run-nonexistent"      2 "run: cannot open"              run "$TMP/nope.bin"
-run_test "run-noexec"           3 "not implemented in this build" run "$TMP/halt.bin"
+run_test "run-exec-halt"       0 ""                              run "$TMP/halt.bin"
 run_test "run-empty-file"       108 "INVALID_PROGRAM"             run "$TMP/empty.bin"
-run_test "run-maxsteps-eq"      3 "not implemented in this build" run "$TMP/halt.bin" --max-steps=1000
-run_test "run-maxsteps-space"   3 "not implemented in this build" run "$TMP/halt.bin" --max-steps 1000
-run_test "run-maxsteps-zero"    3 "not implemented in this build" run "$TMP/halt.bin" --max-steps 0
-run_test "run-maxsteps-u64max"  3 "not implemented in this build" run "$TMP/halt.bin" --max-steps 18446744073709551615
+run_test "run-maxsteps-eq"      0 ""                              run "$TMP/halt.bin" --max-steps=1000
+run_test "run-maxsteps-space"   0 ""                              run "$TMP/halt.bin" --max-steps 1000
+run_test "run-maxsteps-zero"    0 ""                              run "$TMP/halt.bin" --max-steps 0
+run_test "run-maxsteps-u64max"  0 ""                              run "$TMP/halt.bin" --max-steps 18446744073709551615
 run_test "run-maxsteps-bad"     2 "invalid value for --max-steps" run "$TMP/empty.bin" --max-steps abc
 run_test "run-maxsteps-empty"   2 "invalid value for --max-steps" run "$TMP/empty.bin" --max-steps=
 run_test "run-maxsteps-neg"     2 "invalid value for --max-steps" run "$TMP/empty.bin" --max-steps -5

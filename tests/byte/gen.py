@@ -49,35 +49,30 @@ BASE2_CODE = MOV_R0_0 + HALT
 # Each case: (name, file_bytes, expected_exit, [expected stderr substrings])
 CASES = []
 
-# ---------- valid fixtures (loader must accept; run then hits phase-2 stub) --
-CASES.append(("valid_halt", build_file(HALT), 3,
-              ["not implemented in this build"]))
-CASES.append(("valid_data", build_file(HALT, data=b"ABCD"), 3,
-              ["not implemented in this build"]))
+# ---------- valid fixtures (loader must accept; CPU executes them) ------------
+# Phase 3: these now run to completion instead of hitting the phase-2 stub.
+CASES.append(("valid_halt", build_file(HALT), 0, []))
+CASES.append(("valid_data", build_file(HALT, data=b"ABCD"), 0, []))
 CASES.append(("valid_jmp_last",
-              build_file(slot(0x21, cls=0x05, imm=8) + HALT), 3,
-              ["not implemented in this build"]))
+              build_file(slot(0x21, cls=0x05, imm=8) + HALT), 0, []))
 CASES.append(("valid_loadm_max",
-              build_file(slot(0x17, dst=0x00, cls=0x04, imm=0xFFF8) + HALT), 3,
-              ["not implemented in this build"]))
+              build_file(slot(0x17, dst=0x00, cls=0x04, imm=0xFFF8) + HALT),
+              0, []))
 CASES.append(("valid_entry_last",
-              build_file(BASE2_CODE, entry=8), 3,
-              ["not implemented in this build"]))
+              build_file(BASE2_CODE, entry=8), 0, []))
 CASES.append(("valid_layout_max",
-              build_file(HALT, data=b"\x00" * (0xF000 - 8)), 3,
-              ["not implemented in this build"]))
+              build_file(HALT, data=b"\x00" * (0xF000 - 8)), 0, []))
 CASES.append(("valid_all_classes",
               build_file(
                   slot(0x01) +                                    # N  HALT-ish NOP
                   slot(0x02, dst=0x01, src=0x02, cls=0x01) +      # R  MOV
                   slot(0x03, dst=0x01, cls=0x02, imm=0xFFFFFFFF) +  # I  MOV max imm
-                  slot(0x0C, src=0x03, cls=0x03) +               # r  INC
+                  slot(0x0C, dst=0x03, cls=0x03) +               # r  INC R3 (dst=reg, src=0xFF per ISA.md §6)
                   slot(0x17, dst=0x04, cls=0x04, imm=0) +        # M  LOAD [0]
                   slot(0x19, src=0x05, cls=0x04, imm=0xFFF8) +   # M  STORE max
                   slot(0x21, cls=0x05, imm=0) +                 # J  JMP 0
                   HALT,
-                  entry=8 * 7), 3,
-              ["not implemented in this build"]))
+                  entry=8 * 7), 0, []))   # entry lands on HALT: clean exit 0
 
 # ---------- L3: malformed fixtures (normative rejections) --------------------
 # step 2: bad magic

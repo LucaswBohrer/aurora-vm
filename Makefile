@@ -4,7 +4,7 @@ LD        := ld
 NASMFLAGS := -f elf64 -g -w+all
 
 SRC := src/main.asm src/util.asm src/errors.asm src/cli.asm \
-       src/run.asm src/debug.asm src/loader.asm
+       src/run.asm src/debug.asm src/loader.asm src/cpu.asm
 OBJ := $(SRC:src/%.asm=build/obj/%.o)
 BIN := build/aurora
 
@@ -18,12 +18,16 @@ build/obj/%.o: src/%.asm
 	mkdir -p build/obj
 	$(NASM) $(NASMFLAGS) $< -o $@
 
-# loader.o also depends on the shared VM layout include.
-build/obj/loader.o: src/vm.inc
+# loader.o and cpu.o also depend on the shared includes.
+build/obj/loader.o: src/vm.inc src/errids.inc
+build/obj/cpu.o: src/vm.inc src/errids.inc
+build/obj/errors.o: src/errids.inc
 
 test: $(BIN)
 	tests/phase1/run_cli_tests.sh
 	tests/byte/run_l3_tests.sh
+	python3 tests/byte/audit_opcode_fields.py
+	python3 tests/exec/test_cpu_programs.py
 	python3 tests/termination/run_termination_tests.py
 
 fuzz:

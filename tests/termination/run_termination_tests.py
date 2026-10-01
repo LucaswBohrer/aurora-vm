@@ -43,6 +43,10 @@ VERSION = 0x0001
 # full table lives in ISA.md section 6). Classes: N=0, R=1, I=2, r=3.
 REQUIRED_CLASS = {0x01: 0, 0x03: 2, 0x0A: 1, 0x1E: 3}
 
+# class-r opcodes whose register lives in dst (Rd): INC/DEC/NOT/POP/IN.
+# The rest (PUSH/OUT/OUTC) carry it in src (Rs). Per ISA.md §6.
+RCLASS_DST_REG_OPS = {0x0C, 0x0D, 0x14, 0x1E, 0x2A}
+
 # fatal error name -> id (frozen spec; exit code = 100 + id).
 ERROR_IDS = {
     "INVALID_OPCODE": 1, "INVALID_REGISTER": 2, "INVALID_MEMORY_ACCESS": 3,
@@ -81,7 +85,8 @@ FIXTURES = [
     {
         "name": "t5_underflow",
         "code": bytes.fromhex(
-            "1eff000300000000"   # POP R0 on empty stack -> STACK_UNDERFLOW
+            "1e00ff0300000000"   # POP R0 (dst=reg, src=0xFF per ISA.md §6)
+                                # on empty stack -> STACK_UNDERFLOW
             "01ffff0000000000"   # HALT (unreached)
         ),
         "tclass": "FATAL", "reason": "STACK_UNDERFLOW", "exit": 105,
@@ -134,8 +139,11 @@ def scan_slots(code, label):
             good = dst <= 0x0F and src <= 0x0F and imm == 0
         elif cls == 2:    # I
             good = dst <= 0x0F and src == 0xFF
-        elif cls == 3:    # r
-            good = dst == 0xFF and src <= 0x0F and imm == 0
+        elif cls == 3:    # r: register placement is per-opcode (ISA.md §6)
+            if op in RCLASS_DST_REG_OPS:      # INC/DEC/NOT/POP/IN: dst=reg
+                good = dst <= 0x0F and src == 0xFF and imm == 0
+            else:                             # PUSH/OUT/OUTC: src=reg
+                good = dst == 0xFF and src <= 0x0F and imm == 0
         else:
             good = False
         if not good:
@@ -195,32 +203,27 @@ def main():
           and t4["reason"] == "HALT" and t5["reason"] == "STACK_UNDERFLOW",
           "exit=105: NORMAL/HALT vs FATAL/STACK_UNDERFLOW")
 
-    # 5. execution (phase 3): try one fixture; skip cleanly if no CPU yet.
+    # 5. execution: run every fixture and assert the full D22 triple
+    # (termination_class, termination_reason, exit_code).
     exec_failures = []
-    probe = subprocess.run([AURORA, "run",
-                            os.path.join(FIXDIR, "t1_halt0.bin")],
+    for fx in FIXTURES:
+        path = os.path.join(FIXDIR, fx["name"] + ".bin")
+        p = subprocess.run([AURORA, "run", path],
                            capture_output=True, text=True)
-    if "not implemented" in probe.stderr and probe.returncode == 3:
-        print("SKIP: execution checks (loader/CPU not implemented yet, phase 3)")
-    else:
-        for fx in FIXTURES:
-            path = os.path.join(FIXDIR, fx["name"] + ".bin")
-            p = subprocess.run([AURORA, "run", path],
-                               capture_output=True, text=True)
-            m = re.search(r"aurora: error: ([A-Z_]+)", p.stderr)
-            if m:  # fatal: stderr names the error, exit = 100 + id
-                got = ("FATAL", m.group(1), p.returncode)
-                want = (fx["tclass"], fx["reason"], fx["exit"])
-                ok = (got == want
-                      and p.returncode == 100 + ERROR_IDS[m.group(1)])
-            else:  # HALT: any exit 0..255, no error line
-                ok = (fx["tclass"] == "NORMAL" and fx["reason"] == "HALT"
-                      and p.returncode == fx["exit"]
-                      and "aurora: error:" not in p.stderr)
-            check(fx["name"] + " execution triple", ok,
-                  "exit=%d stderr=%r" % (p.returncode, p.stderr.strip()[:60]))
-            if not ok:
-                exec_failures.append(fx["name"])
+        m = re.search(r"aurora: error: ([A-Z_]+)", p.stderr)
+        if m:  # fatal: stderr names the error, exit = 100 + id
+            got = ("FATAL", m.group(1), p.returncode)
+            want = (fx["tclass"], fx["reason"], fx["exit"])
+            ok = (got == want
+                  and p.returncode == 100 + ERROR_IDS[m.group(1)])
+        else:  # HALT: any exit 0..255, no error line
+            ok = (fx["tclass"] == "NORMAL" and fx["reason"] == "HALT"
+                  and p.returncode == fx["exit"]
+                  and "aurora: error:" not in p.stderr)
+        check(fx["name"] + " execution triple", ok,
+              "exit=%d stderr=%r" % (p.returncode, p.stderr.strip()[:60]))
+        if not ok:
+            exec_failures.append(fx["name"])
 
     print("---")
     if failures:
