@@ -1,0 +1,2 @@
+LOADB R0, [0x1000]
+HALT

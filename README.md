@@ -59,24 +59,34 @@ CPU with breakpoints and inspection.
 
 ## Example
 
-`examples/hello.asm` (illustrative — the assembler arrives in phase 5):
+`examples/hello.asm` — assembled with `tools/aurora-asm` (phase 4):
 
 ```asm
-; Print 42 and halt. R0 = 42, so the exit code is 42 & 0xFF = 42.
-MOV R0, 42
-OUT R0        ; prints R0 as signed decimal + newline
-HALT          ; exit code = R0 & 0xFF
+; Print "Hello, world!" and halt with exit code 0.
+    MOV R0, msg
+loop:
+    LOADB R1, [R0]
+    CMP R1, 0
+    JE done
+    OUTC R1
+    ADD R0, 1
+    JMP loop
+done:
+    MOV R0, 0
+    HALT
+
+msg: DB "Hello, world!", 10, 0
 ```
 
-Pipeline (phases 3–5 will make this end-to-end):
+Pipeline (end-to-end since phase 4):
 
 ```text
 hello.asm
-  ↓  aurora-asm (phase 5)
-hello.bin            ← 26-byte header + 3 fixed 8-byte instructions
+  ↓  aurora-asm (phase 4)
+hello.bin            ← 26-byte header + 9 fixed 8-byte instructions
   ↓  aurora run (phase 3)
-42                   ← stdout
-(exit code 42)
+Hello, world!        ← stdout
+(exit code 0)
 ```
 
 Hand-assembled per `docs/BYTECODE.md` (header: magic `41 55 52 4F 52 41 01 00`,
@@ -147,7 +157,7 @@ Full normative specification: [`docs/BYTECODE.md`](docs/BYTECODE.md).
 
 ## Debugger
 
-`aurora debug <file>` (phase 4) — interactive debugger in Assembly:
+`aurora debug <file>` (phase 5) — interactive debugger in Assembly:
 
 - 16 breakpoints, `run` / `step` / `continue`
 - register dump, memory dump, stack view, backtrace
@@ -206,7 +216,7 @@ aurora-vm/
 │   ├── run.asm     # `aurora run`
 │   ├── debug.asm   # `aurora debug`
 │   └── loader.asm  # bytecode loader (phase 2)
-├── tools/          # assembler — Python 3 stdlib only (phase 5)
+├── tools/          # assembler — Python 3 stdlib only (phase 4)
 ├── programs/       # sample AURORA programs (phase 6)
 ├── tests/          # test suites per phase + golden vectors
 ├── docs/           # normative specifications
@@ -237,11 +247,11 @@ aurora-vm/
 |-------|-------|-------|
 | 0 | Architecture + frozen ISA/bytecode spec | ✅ done |
 | 1 | Foundation: CLI skeleton, error reporting | ✅ done |
-| 2 | Loader: header + instruction-slot validation | ⬜ next |
-| 3 | CPU core: 43 handlers, flags, memory, stack, I/O | ⬜ planned |
-| 4 | Interactive debugger | ⬜ planned |
-| 5 | Assembler (Python stdlib) | ⬜ planned |
-| 6 | Sample programs + fib(30) stress | ⬜ planned |
+| 2 | Loader: header + instruction-slot validation | ✅ done |
+| 3 | CPU core: 43 handlers, flags, memory, stack, I/O | ✅ done |
+| 4 | Assembler (Python 3 stdlib) + sample programs | ✅ done |
+| 5 | Interactive debugger | ⬜ next |
+| 6 | Fib(30) stress + full program suite | ⬜ planned |
 | 7 | Full suite + fuzzing + final docs | ⬜ planned |
 
 Only phases marked ✅ are implemented. Nothing above is presented as working

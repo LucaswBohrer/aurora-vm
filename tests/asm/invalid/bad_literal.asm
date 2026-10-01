@@ -1,0 +1,2 @@
+MOV R0, 0xZZ
+HALT

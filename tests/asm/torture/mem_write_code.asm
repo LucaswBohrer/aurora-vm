@@ -1,0 +1,4 @@
+MOV R0, 0
+MOV R1, 1
+STORE [0x0], R1
+HALT

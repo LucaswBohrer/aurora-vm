@@ -1,0 +1,3 @@
+IN R0
+OUTC R0
+HALT

@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""
+tools/aurora-asm -- assembler for the AURORA VM.
+
+Reads AURORA Assembly language (.asm) and emits v1 bytecode (.bin) exactly
+as specified in docs/BYTECODE.md. Two passes, Python 3 standard library
+only, fully deterministic.
+
+This tool is NOT the ISA authority. The normative source is docs/ISA.md;
+the golden vectors in docs/ISA.md section 12 validate the VM independently
+of this assembler. The opcode/operand table below is a transcription of
+docs/ISA.md section 6 -- if it ever disagrees with the spec, the spec wins.
+
+Assembly language summary (full reference: docs/ASSEMBLER.md):
+
+    ; comment                        -- ';' starts a comment
+    label:                           -- code or data label definition
+        MOV R0, 42                   -- mnemonic + comma-separated operands
+        ADD R0, R1                   -- registers R0-R15 (case-insensitive)
+        LOAD R2, [0x1000]            -- absolute memory address
+        STORE [R3], R1               -- register-indirect memory address
+        JMP loop                     -- labels resolve to absolute offsets
+    msg: DB "Hello", 10, 0           -- data bytes (DW/DD/DQ also exist)
+
+Exit codes: 0 = success, 1 = assembly error (diagnostic on stderr),
+2 = command-line/file usage error.
+"""
+
+import os
+import re
+import sys
+
+ASM_VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Bytecode constants (docs/BYTECODE.md, frozen v1)
+# ---------------------------------------------------------------------------
+
+MAGIC = bytes((0x41, 0x55, 0x52, 0x4F, 0x52, 0x41, 0x01, 0x00))
+BYTECODE_VERSION = 0x0001
+HEADER_SIZE = 0x1A
+MAX_CODE_DATA = 0xF000  # code_size + data_size must not reach the stack
+
+# Instruction classes (docs/ISA.md section 4)
+CLS_N = 0x00  # no operands
+CLS_R = 0x01  # dst register + src register
+CLS_I = 0x02  # dst register + imm32
+CLS_r = 0x03  # single register
+CLS_M = 0x04  # register + absolute address
+CLS_J = 0x05  # absolute code address
+
+UNUSED = 0xFF
+
+I32_MIN = -(2 ** 31)
+I32_MAX_U = 2 ** 32 - 1
+MEM_TOP = 0x10000
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class AsmError(Exception):
+    """A user-facing assembly error carrying its source position."""
+
+    def __init__(self, line, col, category, detail=""):
+        super().__init__(category)
+        self.line = line
+        self.col = col
+        self.category = category
+        self.detail = detail
+
+    def render(self, filename):
+        loc = "%s:%d:%d" % (filename, self.line, self.col)
+        if self.detail:
+            return "%s: %s: %s" % (loc, self.category, self.detail)
+        return "%s: %s" % (loc, self.category)
+
+
+# ---------------------------------------------------------------------------
+# Lexical helpers
+# ---------------------------------------------------------------------------
+
+LABEL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+LABEL_DEF_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*):")
+NUMBER_RE = re.compile(r"[+-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+)")
+MNEMONIC_RE = re.compile(r"[A-Za-z]+")
+
+
+def strip_comment(text):
+    """Remove a ';' comment, honouring double-quoted string literals."""
+    out = []
+    in_str = False
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+                out.append(c)
+            elif c == ";":
+                break
+            else:
+                out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def split_operands(text, lineno, base_col):
+    """Split an operand list on top-level commas.
+
+    Returns [(operand_text, col)] with 1-based columns relative to the
+    start of the line. Commas inside [...] or "..." do not split.
+    """
+    parts = []
+    depth = 0
+    in_str = False
+    cur = []
+    start = None
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        col = base_col + i
+        if in_str:
+            cur.append(c)
+            if c == "\\" and i + 1 < n:
+                cur.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            if start is None:
+                start = col
+            cur.append(c)
+        elif c == "[":
+            depth += 1
+            if start is None:
+                start = col
+            cur.append(c)
+        elif c == "]":
+            depth -= 1
+            if depth < 0:
+                raise AsmError(lineno, col, "syntax error",
+                               "unmatched ']'")
+            cur.append(c)
+        elif c == "," and depth == 0:
+            parts.append(("".join(cur), start if start is not None else col))
+            cur = []
+            start = None
+        else:
+            if start is None and not c.isspace():
+                start = col
+            cur.append(c)
+        i += 1
+    if in_str:
+        raise AsmError(lineno, base_col + n, "syntax error",
+                       "unterminated string literal")
+    if depth != 0:
+        raise AsmError(lineno, base_col + n, "syntax error",
+                       "unclosed '['")
+    if cur and "".join(cur).strip():
+        parts.append(("".join(cur), start if start is not None else base_col + n))
+    return [(p.strip(), c) for (p, c) in parts]
+
+
+def parse_number(text, lineno, col):
+    """Parse a numeric literal. Returns the mathematical integer value."""
+    if not NUMBER_RE.fullmatch(text):
+        raise AsmError(lineno, col, "invalid numeric literal",
+                       repr(text))
+    neg = text[0] == "-"
+    body = text[1:] if text[0] in "+-" else text
+    if body[:2] in ("0x", "0X"):
+        value = int(body, 16)
+    elif body[:2] in ("0b", "0B"):
+        value = int(body, 2)
+    else:
+        value = int(body, 10)
+    return -value if neg else value
+
+
+def parse_string(text, lineno, col):
+    """Parse a double-quoted string literal into bytes.
+
+    Supported escapes: \\n \\t \\r \\0 \\\\ \\" \\xHH.
+    """
+    if len(text) < 2 or not text.startswith('"'):
+        raise AsmError(lineno, col, "invalid data operand",
+                       "expected string literal, got %r" % text)
+    out = bytearray()
+    i = 1
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            if i != n - 1:
+                raise AsmError(lineno, col, "syntax error",
+                               "unexpected characters after string literal")
+            return bytes(out)
+        if c == "\\":
+            if i + 1 >= n:
+                raise AsmError(lineno, col, "invalid data operand",
+                               "dangling backslash in string literal")
+            e = text[i + 1]
+            if e == "n":
+                out.append(0x0A)
+            elif e == "t":
+                out.append(0x09)
+            elif e == "r":
+                out.append(0x0D)
+            elif e == "0":
+                out.append(0x00)
+            elif e == "\\":
+                out.append(0x5C)
+            elif e == '"':
+                out.append(0x22)
+            elif e == "x":
+                hexd = text[i + 2:i + 4]
+                if len(hexd) != 2 or not re.fullmatch(r"[0-9a-fA-F]{2}", hexd):
+                    raise AsmError(lineno, col, "invalid data operand",
+                                   "bad \\x escape in string literal")
+                out.append(int(hexd, 16))
+                i += 2
+            else:
+                raise AsmError(lineno, col, "invalid data operand",
+                               "unknown escape '\\%s' in string literal" % e)
+            i += 2
+            continue
+        o = ord(c)
+        if o > 0x7E or (o < 0x20 and c not in "\t"):
+            raise AsmError(lineno, col, "invalid data operand",
+                           "non-printable character in string literal; "
+                           "use \\xHH escapes")
+        out.append(o)
+        i += 1
+    raise AsmError(lineno, col, "syntax error", "unterminated string literal")
+
+
+# Operands are tuples: ("reg", n) | ("imm", v) | ("label", name)
+#                    | ("memreg", n) | ("memabs", expr) | ("str", bytes)
+# where expr is ("imm", v) or ("label", name).
+
+def parse_operand(text, col, lineno):
+    t = text.strip()
+    if not t:
+        raise AsmError(lineno, col, "syntax error", "empty operand")
+    # Register: anything starting with R/r is register-shaped; anything
+    # that is not exactly R0-R15 is an invalid register (R16, R99, R-1...).
+    if t[0] in "Rr":
+        m = re.fullmatch(r"[Rr]([0-9]+)", t)
+        if m:
+            num = int(m.group(1))
+            if num > 15:
+                raise AsmError(lineno, col, "invalid register", repr(t))
+            return ("reg", num)
+        # Register-shaped but malformed. A whitespace inside usually
+        # means a forgotten comma between operands ("MOV R0 R1").
+        if re.search(r"\s", t):
+            raise AsmError(lineno, col, "syntax error",
+                           "bad register operand %r (missing comma?)" % t)
+        raise AsmError(lineno, col, "invalid register", repr(t))
+    # Memory operand: [expr]
+    if t.startswith("["):
+        if not t.endswith("]"):
+            raise AsmError(lineno, col, "syntax error", "unclosed '['")
+        inner = t[1:-1].strip()
+        inner_col = col + (t.index(inner) if inner else 1)
+        if not inner:
+            raise AsmError(lineno, col, "syntax error",
+                           "empty memory operand")
+        if inner[0] in "Rr":
+            m = re.fullmatch(r"[Rr]([0-9]+)", inner)
+            if m:
+                if int(m.group(1)) > 15:
+                    raise AsmError(lineno, inner_col, "invalid register",
+                                   repr(inner))
+                return ("memreg", int(m.group(1)))
+            raise AsmError(lineno, inner_col, "syntax error",
+                           "bad memory operand [%s]" % inner)
+        if NUMBER_RE.fullmatch(inner):
+            return ("memabs", ("imm", parse_number(inner, lineno, inner_col)))
+        if LABEL_RE.fullmatch(inner):
+            return ("memabs", ("label", inner))
+        raise AsmError(lineno, inner_col, "syntax error",
+                       "bad memory operand %r" % inner)
+    # Numeric literal
+    if NUMBER_RE.fullmatch(t):
+        return ("imm", parse_number(t, lineno, col))
+    # String literal (only meaningful in DB; rejected elsewhere later)
+    if t.startswith('"'):
+        return ("str", parse_string(t, lineno, col))
+    # Label reference
+    if LABEL_RE.fullmatch(t):
+        return ("label", t)
+    # Anything else: decide between "invalid numeric literal" and
+    # "syntax error" by shape.
+    if re.fullmatch(r"[+-]?[0-9a-zA-Z_]+", t):
+        raise AsmError(lineno, col, "invalid numeric literal", repr(t))
+    raise AsmError(lineno, col, "syntax error",
+                   "cannot parse operand %r" % t)
+
+
+# ---------------------------------------------------------------------------
+# Pass 1: parse lines, collect labels, lay out code and data
+# ---------------------------------------------------------------------------
+
+DIRECTIVES = ("DB", "DW", "DD", "DQ")
+
+
+def parse_source(filename, text):
+    """First pass over the source.
+
+    Returns (items, code_labels, data_labels, code_size) where items is a
+    list of ("instr", lineno, col, mnemonic, operands) and
+    ("data", lineno, col, directive, operands) in source order.
+    """
+    items = []
+    code_labels = {}
+    data_labels = {}
+    defined = {}  # name -> (lineno, col) for duplicate detection
+    pending = []  # labels waiting for the next item to fix their section
+
+    def define_label(name, lineno, col):
+        if name in defined:
+            prev = defined[name]
+            raise AsmError(lineno, col, "duplicate label",
+                           "%r already defined at line %d" % (name, prev[0]))
+        defined[name] = (lineno, col)
+        pending.append((name, lineno, col))
+
+    def flush_pending(section, addr):
+        table = code_labels if section == "code" else data_labels
+        for (name, _ln, _co) in pending:
+            table[name] = addr
+        pending.clear()
+
+    pc = 0  # code offset in bytes
+    dc = 0  # data offset in bytes
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = strip_comment(raw.rstrip("\r\n")).rstrip()
+        if not line.strip():
+            continue
+        stripped = line.lstrip()
+        base = len(line) - len(stripped)  # 0-based indent
+        col0 = base + 1                   # 1-based column of first token
+
+        # Optional label definition at the start of the line.
+        rest = stripped
+        rest_col = col0
+        m = LABEL_DEF_RE.match(stripped)
+        if m and (len(stripped) == m.end() or stripped[m.end()].isspace()):
+            name = m.group(1)
+            define_label(name, lineno, col0)
+            rest = stripped[m.end():].lstrip()
+            rest_col = col0 + (len(stripped) - len(stripped[m.end():].lstrip()))
+            if not rest:
+                continue
+
+        # Label-shaped but invalid name ("1bad:", "my-label:").
+        # (Valid "name:" definitions were consumed above.)
+        lm = re.match(r"([^:\s]+):", rest)
+        if lm and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", lm.group(1)):
+            raise AsmError(lineno, rest_col, "invalid label",
+                           repr(lm.group(1)))
+
+        # Mnemonic or directive.
+        if rest.startswith("."):
+            d = rest.split()[0]
+            raise AsmError(lineno, rest_col, "invalid directive", repr(d))
+        mm = MNEMONIC_RE.match(rest)
+        if not mm:
+            raise AsmError(lineno, rest_col, "syntax error",
+                           "expected instruction, got %r" % rest)
+        word = mm.group(0)
+        upper = word.upper()
+        after = rest[mm.end():]
+        if after and not after[0].isspace():
+            raise AsmError(lineno, rest_col, "syntax error",
+                           "unexpected %r after %r" % (after.strip(), word))
+        operand_text = after.strip()
+        operand_col = rest_col + (len(rest) - len(after.lstrip()))
+
+        if upper in DIRECTIVES:
+            flush_pending("data", dc)
+            if not operand_text:
+                raise AsmError(lineno, operand_col, "missing operand",
+                               "expected data items after %s" % upper)
+            operands = []
+            for (op_text, op_col) in split_operands(operand_text, lineno,
+                                                    operand_col):
+                operands.append((parse_operand(op_text, op_col, lineno),
+                                 op_text, op_col))
+            items.append(("data", lineno, rest_col, upper, operands))
+            dc += data_size_of(upper, operands, lineno)
+        else:
+            flush_pending("code", pc)
+            operands = []
+            if operand_text:
+                for (op_text, op_col) in split_operands(operand_text, lineno,
+                                                        operand_col):
+                    operands.append((parse_operand(op_text, op_col, lineno),
+                                     op_text, op_col))
+            items.append(("instr", lineno, rest_col, upper, operands,
+                          word))
+            pc += 8
+
+    # Labels dangling at end of file point at the end of the code section.
+    flush_pending("code", pc)
+    return items, code_labels, data_labels, pc
+
+
+def data_size_of(directive, operands, lineno):
+    """Byte size a data directive occupies (pass 1; validity in pass 2)."""
+    if directive == "DB":
+        total = 0
+        for (op, _text, col) in operands:
+            if op[0] == "str":
+                total += len(op[1])
+            else:
+                total += 1
+        return total
+    width = {"DW": 2, "DD": 4, "DQ": 8}[directive]
+    return width * len(operands)
+
+# ---------------------------------------------------------------------------
+# Pass 2: encode instructions (docs/ISA.md section 6)
+# ---------------------------------------------------------------------------
+#
+# For every mnemonic the accepted operand shapes are listed explicitly.
+# dst/src/imm placement follows the ISA tables, including the class-r
+# subtlety: INC/DEC/NOT/POP/IN carry the register in dst (src = 0xFF)
+# while PUSH/OUT/OUTC carry it in src (dst = 0xFF).
+
+def _reg(op, lineno, col, what):
+    if op[0] != "reg":
+        raise AsmError(lineno, col, "invalid operand",
+                       "expected register for %s" % what)
+    return op[1]
+
+
+def _imm(op, lineno, col, what):
+    if op[0] != "imm":
+        raise AsmError(lineno, col, "invalid operand",
+                       "expected numeric immediate for %s" % what)
+    return op[1]
+
+
+def check_i32(value, lineno, col):
+    """Class-I immediates accept any 32-bit pattern (docs/BYTECODE.md).
+
+    The literal's mathematical value must fit in [-2^31, 2^32-1]; it is
+    then encoded as the low 32 bits (two's complement).
+    """
+    if not (I32_MIN <= value <= I32_MAX_U):
+        raise AsmError(lineno, col, "immediate out of range",
+                       "%d does not fit in 32 bits" % value)
+    return value & 0xFFFFFFFF
+
+
+class Ctx:
+    """Label resolution context for pass 2."""
+
+    def __init__(self, code_labels, data_labels, code_size):
+        self.code_labels = code_labels
+        self.data_labels = data_labels
+        self.code_size = code_size
+
+    def data_addr(self, name, lineno, col):
+        """Absolute virtual address of a code or data label."""
+        if name in self.code_labels:
+            return self.code_labels[name]
+        if name in self.data_labels:
+            return self.code_size + self.data_labels[name]
+        raise AsmError(lineno, col, "undefined label", repr(name))
+
+    def code_addr(self, name, lineno, col):
+        """Code-relative offset of a code label (jumps/CALL only)."""
+        if name in self.data_labels:
+            raise AsmError(lineno, col, "jump to data label",
+                           "%r is a data label" % name)
+        if name in self.code_labels:
+            return self.code_labels[name]
+        raise AsmError(lineno, col, "undefined label", repr(name))
+
+    def abs_mem_addr(self, expr, lineno, col):
+        """Absolute address for class-M [a32]; loader rule enforced."""
+        if expr[0] == "imm":
+            addr = expr[1]
+        else:
+            addr = self.data_addr(expr[1], lineno, col)
+        if not (0 <= addr <= MEM_TOP - 8):
+            raise AsmError(lineno, col, "address out of range",
+                           "0x%X is not a valid 64-bit access address "
+                           "(loader requires addr <= 0x10000 - 8)" % addr)
+        return addr
+
+    def jump_target(self, op, op_text, op_col, lineno):
+        if op[0] == "label":
+            addr = self.code_addr(op[1], lineno, op_col)
+        elif op[0] == "imm":
+            addr = op[1]
+        else:
+            raise AsmError(lineno, op_col, "invalid operand",
+                           "expected code label or address, got %r" % op_text)
+        if not (0 <= addr < self.code_size and addr % 8 == 0):
+            raise AsmError(lineno, op_col, "invalid jump target",
+                           "0x%X is not an instruction boundary inside "
+                           "the code section" % addr)
+        return addr
+
+
+def expect_count(ops, want, lineno, col, mnemonic):
+    if len(ops) < want:
+        raise AsmError(lineno, col, "missing operand",
+                       "%s expects %d operand(s)" % (mnemonic, want))
+    if len(ops) > want:
+        _op, text, op_col = ops[want]
+        raise AsmError(lineno, op_col, "unexpected operand",
+                       "%s expects %d operand(s), got %r"
+                       % (mnemonic, want, text))
+
+
+def encode_instr(mnemonic, word, ops, lineno, col, ctx):
+    """Encode one instruction. Returns (opcode, cls, dst, src, imm32)."""
+    n = len(ops)
+    get = lambda i: (ops[i][0], ops[i][1], ops[i][2])  # (operand, text, col)
+
+    # -- N class: no operands -------------------------------------------
+    if mnemonic in ("NOP", "HALT", "RET"):
+        expect_count(ops, 0, lineno, col, word)
+        return {"NOP": 0x00, "HALT": 0x01, "RET": 0x20}[mnemonic], \
+            CLS_N, UNUSED, UNUSED, 0
+
+    # -- r class, register in dst ---------------------------------------
+    if mnemonic in ("INC", "DEC", "NOT", "POP", "IN"):
+        expect_count(ops, 1, lineno, col, word)
+        op, _t, c = get(0)
+        rd = _reg(op, lineno, c, word)
+        opcode = {"INC": 0x0C, "DEC": 0x0D, "NOT": 0x14,
+                  "POP": 0x1E, "IN": 0x2A}[mnemonic]
+        return opcode, CLS_r, rd, UNUSED, 0
+
+    # -- r class, register in src ---------------------------------------
+    if mnemonic in ("PUSH", "OUT", "OUTC"):
+        expect_count(ops, 1, lineno, col, word)
+        op, _t, c = get(0)
+        rs = _reg(op, lineno, c, word)
+        opcode = {"PUSH": 0x1D, "OUT": 0x28, "OUTC": 0x29}[mnemonic]
+        return opcode, CLS_r, UNUSED, rs, 0
+
+    # -- MOV: R form, I form, or label form ------------------------------
+    if mnemonic == "MOV":
+        expect_count(ops, 2, lineno, col, word)
+        (dst, _t0, c0), (src, t1, c1) = get(0), get(1)
+        rd = _reg(dst, lineno, c0, "MOV destination")
+        if src[0] == "reg":
+            return 0x02, CLS_R, rd, src[1], 0
+        if src[0] == "imm":
+            return 0x03, CLS_I, rd, UNUSED, check_i32(src[1], lineno, c1)
+        if src[0] == "label":
+            addr = ctx.data_addr(src[1], lineno, c1)
+            return 0x03, CLS_I, rd, UNUSED, check_i32(addr, lineno, c1)
+        raise AsmError(lineno, c1, "invalid operand",
+                       "MOV expects a register, immediate or label, got %r"
+                       % t1)
+
+    # -- ALU R/RI: ADD SUB MUL DIV AND OR XOR, and CMP -------------------
+    alu = {"ADD": (0x04, 0x05), "SUB": (0x06, 0x07), "MUL": (0x08, 0x09),
+           "DIV": (0x0A, 0x0B), "AND": (0x0E, 0x0F), "OR": (0x10, 0x11),
+           "XOR": (0x12, 0x13), "CMP": (0x15, 0x16)}
+    if mnemonic in alu:
+        expect_count(ops, 2, lineno, col, word)
+        (dst, _t0, c0), (src, t1, c1) = get(0), get(1)
+        rd = _reg(dst, lineno, c0, "%s destination" % word)
+        op_r, op_i = alu[mnemonic]
+        if src[0] == "reg":
+            return op_r, CLS_R, rd, src[1], 0
+        if src[0] == "imm":
+            return op_i, CLS_I, rd, UNUSED, check_i32(src[1], lineno, c1)
+        raise AsmError(lineno, c1, "invalid operand",
+                       "%s expects a register or numeric immediate, got %r"
+                       % (word, t1))
+
+    # -- Memory ----------------------------------------------------------
+    if mnemonic == "LOAD":
+        expect_count(ops, 2, lineno, col, word)
+        (dst, _t0, c0), (mem, t1, c1) = get(0), get(1)
+        rd = _reg(dst, lineno, c0, "LOAD destination")
+        if mem[0] == "memreg":
+            return 0x18, CLS_R, rd, mem[1], 0
+        if mem[0] == "memabs":
+            return 0x17, CLS_M, rd, UNUSED, \
+                ctx.abs_mem_addr(mem[1], lineno, c1)
+        raise AsmError(lineno, c1, "invalid operand",
+                       "LOAD expects [address] or [register], got %r" % t1)
+
+    if mnemonic == "STORE":
+        expect_count(ops, 2, lineno, col, word)
+        (mem, t0, c0), (src, _t1, c1) = get(0), get(1)
+        rs = _reg(src, lineno, c1, "STORE source")
+        if mem[0] == "memreg":
+            return 0x1A, CLS_R, mem[1], rs, 0
+        if mem[0] == "memabs":
+            return 0x19, CLS_M, UNUSED, rs, \
+                ctx.abs_mem_addr(mem[1], lineno, c0)
+        raise AsmError(lineno, c0, "invalid operand",
+                       "STORE expects [address] or [register], got %r" % t0)
+
+    if mnemonic == "LOADB":
+        expect_count(ops, 2, lineno, col, word)
+        (dst, _t0, c0), (mem, t1, c1) = get(0), get(1)
+        rd = _reg(dst, lineno, c0, "LOADB destination")
+        if mem[0] != "memreg":
+            raise AsmError(lineno, c1, "invalid operand",
+                           "LOADB expects [register], got %r" % t1)
+        return 0x1B, CLS_R, rd, mem[1], 0
+
+    if mnemonic == "STOREB":
+        expect_count(ops, 2, lineno, col, word)
+        (mem, t0, c0), (src, _t1, c1) = get(0), get(1)
+        rs = _reg(src, lineno, c1, "STOREB source")
+        if mem[0] != "memreg":
+            raise AsmError(lineno, c0, "invalid operand",
+                           "STOREB expects [register], got %r" % t0)
+        return 0x1C, CLS_R, mem[1], rs, 0
+
+    # -- J class ----------------------------------------------------------
+    jumps = {"CALL": 0x1F, "JMP": 0x21, "JE": 0x22, "JNE": 0x23,
+             "JG": 0x24, "JL": 0x25, "JGE": 0x26, "JLE": 0x27}
+    if mnemonic in jumps:
+        expect_count(ops, 1, lineno, col, word)
+        op, t, c = get(0)
+        return jumps[mnemonic], CLS_J, UNUSED, UNUSED, \
+            ctx.jump_target(op, t, c, lineno)
+
+    raise AsmError(lineno, col, "unknown mnemonic", repr(word))
+
+
+def encode_data(directive, operands, lineno):
+    """Encode a DB/DW/DD/DQ directive into bytes."""
+    out = bytearray()
+    for (op, text, col) in operands:
+        if directive == "DB":
+            if op[0] == "str":
+                out += op[1]
+            elif op[0] == "imm":
+                v = op[1]
+                if not (-128 <= v <= 255):
+                    raise AsmError(lineno, col, "immediate out of range",
+                                   "%d does not fit in a byte" % v)
+                out.append(v & 0xFF)
+            else:
+                raise AsmError(lineno, col, "invalid data operand",
+                               "DB expects numbers or string literals, got "
+                               "%r" % text)
+            continue
+        # DW / DD / DQ: numbers only.
+        if op[0] != "imm":
+            raise AsmError(lineno, col, "invalid data operand",
+                           "%s expects numbers, got %r" % (directive, text))
+        v = op[1]
+        width, lo, hi = {"DW": (2, -2 ** 15, 2 ** 16 - 1),
+                         "DD": (4, -2 ** 31, 2 ** 32 - 1),
+                         "DQ": (8, -2 ** 63, 2 ** 64 - 1)}[directive]
+        if not (lo <= v <= hi):
+            raise AsmError(lineno, col, "immediate out of range",
+                           "%d does not fit in %d bits" % (v, width * 8))
+        out += (v & (2 ** (width * 8) - 1)).to_bytes(width, "little")
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# Assembly driver
+# ---------------------------------------------------------------------------
+
+def assemble_source(filename, text):
+    """Assemble source text. Returns the complete bytecode file bytes."""
+    items, code_labels, data_labels, code_size = parse_source(filename, text)
+
+    code_items = [it for it in items if it[0] == "instr"]
+    if not code_items:
+        raise AsmError(1, 1, "empty program",
+                       "no instructions to assemble")
+
+    ctx = Ctx(code_labels, data_labels, code_size)
+    code = bytearray()
+    for (_k, lineno, col, mnemonic, operands, word) in code_items:
+        opcode, cls, dst, src, imm = encode_instr(mnemonic, word, operands,
+                                                  lineno, col, ctx)
+        code += bytes((opcode, dst, src, cls))
+        code += imm.to_bytes(4, "little")
+
+    data = bytearray()
+    for (_k, lineno, _col, directive, operands) in \
+            [it for it in items if it[0] == "data"]:
+        data += encode_data(directive, operands, lineno)
+
+    if len(code) + len(data) > MAX_CODE_DATA:
+        raise AsmError(1, 1, "program too large",
+                       "code+data is 0x%X bytes, limit is 0x%X"
+                       % (len(code) + len(data), MAX_CODE_DATA))
+
+    header = bytearray()
+    header += MAGIC
+    header += BYTECODE_VERSION.to_bytes(2, "little")
+    header += len(code).to_bytes(4, "little")
+    header += (0).to_bytes(4, "little")          # entry: first instruction
+    header += len(data).to_bytes(4, "little")
+    header += (0).to_bytes(4, "little")          # reserved
+    assert len(header) == HEADER_SIZE
+    return bytes(header) + bytes(code) + bytes(data)
+
+
+def assemble_file(input_path):
+    try:
+        with open(input_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return (2, "aurora-asm: cannot open %r: no such file" % input_path)
+    except OSError as e:
+        return (2, "aurora-asm: cannot read %r: %s" % (input_path, e))
+    except UnicodeDecodeError:
+        return (2, "aurora-asm: %r is not valid UTF-8 text" % input_path)
+    try:
+        blob = assemble_source(input_path, text)
+    except AsmError as e:
+        return (1, "aurora-asm: " + e.render(input_path))
+    return (0, blob)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+HELP = """\
+usage: aurora-asm [options] input.asm [-o output.bin]
+
+Assemble AURORA Assembly language into v1 bytecode (docs/BYTECODE.md).
+
+options:
+  -o FILE        write bytecode to FILE (default: input with .bin suffix)
+  --help         show this help and exit
+  --version      show the assembler version and exit
+
+Exit codes: 0 = success, 1 = assembly error, 2 = usage/file error.
+
+Language reference: docs/ASSEMBLER.md. The ISA authority is docs/ISA.md.
+"""
+
+
+def default_output(input_path):
+    base, ext = os.path.splitext(input_path)
+    if ext.lower() == ".asm":
+        return base + ".bin"
+    return input_path + ".bin"
+
+
+def main(argv):
+    args = list(argv[1:])
+    out_path = None
+    input_path = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--help", "-h"):
+            sys.stdout.write(HELP)
+            return 0
+        if a == "--version":
+            sys.stdout.write("aurora-asm %s (bytecode v1)\n" % ASM_VERSION)
+            return 0
+        if a == "-o":
+            if i + 1 >= len(args):
+                sys.stderr.write("aurora-asm: -o requires a file argument\n")
+                return 2
+            out_path = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("-"):
+            sys.stderr.write("aurora-asm: unknown option %r\n" % a)
+            return 2
+        if input_path is not None:
+            sys.stderr.write("aurora-asm: unexpected extra argument %r\n" % a)
+            return 2
+        input_path = a
+        i += 1
+
+    if input_path is None:
+        sys.stderr.write("aurora-asm: missing input file\n%s" % HELP)
+        return 2
+    if out_path is None:
+        out_path = default_output(input_path)
+    if os.path.abspath(input_path) == os.path.abspath(out_path):
+        sys.stderr.write("aurora-asm: input and output are the same file\n")
+        return 2
+
+    code, result = assemble_file(input_path)
+    if code != 0:
+        sys.stderr.write(result + "\n")
+        return code
+    try:
+        with open(out_path, "wb") as f:
+            f.write(result)
+    except OSError as e:
+        sys.stderr.write("aurora-asm: cannot write %r: %s\n"
+                         % (out_path, e))
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except AsmError as e:  # should never escape assemble_source
+        sys.stderr.write("aurora-asm: internal error: %s\n" % e)
+        sys.exit(3)

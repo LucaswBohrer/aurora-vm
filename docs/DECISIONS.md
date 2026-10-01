@@ -264,3 +264,43 @@ fuzzing oracle is now an `(exit code, stderr)` consistency check against
 the termination class; `TESTING.md` §10 adds five normative termination
 tests (T1–T5) proving that identical exit codes can mean different
 terminations; D09 and D16 carry amendment notes (history preserved).
+
+## D23 — 2026-10-01 — Assembler language choices (phase 4)
+
+**Problem:** the frozen ISA specifies mnemonics, operand shapes, encoding
+and bytecode exactly, but no assembly *language* (comments, labels,
+literals, directives, diagnostics). The assembler (`tools/aurora-asm`)
+had to choose a concrete syntax without inventing semantics.
+
+**Decision:** the syntax follows the ISA text as literally as possible:
+
+- Mnemonics, register names and directives are case-insensitive;
+  labels are case-sensitive (labels are user-defined names, and
+  case-folding them would create collisions the spec never defines).
+- `;` starts a comment (except inside string literals); labels are
+  `name:`; memory operands are `[a32]` / `[Rs]` exactly as written in
+  ISA §6; data directives are `DB`/`DW`/`DD`/`DQ` with the widths the
+  spec's own examples imply.
+- No entry-point directive: output always uses `entry = 0`, the first
+  instruction. An entry directive would be a new semantic; omitting it
+  keeps every assembled program's layout fully determined by source
+  order.
+- Class-I immediates accept the full `-2^31..2^32-1` pattern range,
+  mirroring the loader rule (BYTECODE.md §2), encoded as low 32 bits.
+  Out-of-range values are a hard assembly error, never silent
+  truncation.
+- The assembler re-checks the loader's address rules (`[a32]` within
+  `0x10000 - 8`, jump targets inside code, `code + data <= 0xF000`) at
+  assembly time so invalid programs fail early with a `file:line:col`
+  diagnostic instead of producing bytecode the loader would refuse.
+
+**Non-decisions (deliberately left out):** macros, includes, constants
+(`EQU`), sections, alignment directives, relocation, listing output.
+None is needed to express any of the 43 opcodes, and each would be a
+new semantic the frozen spec does not define.
+
+**Consequences:** `docs/ASSEMBLER.md` is the language reference;
+`tests/asm/` pins the syntax, the 43/43 opcode coverage, the class-`r`
+field placement, the V1–V9 byte-exact golden comparison, and 33
+negative diagnostics. The golden vectors in ISA §12 remain the
+normative authority and stay assembler-independent.

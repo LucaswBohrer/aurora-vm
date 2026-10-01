@@ -1,0 +1,2 @@
+LOAD R0, [R1+4]
+HALT

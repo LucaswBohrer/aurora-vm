@@ -17,6 +17,7 @@ venv/
 *.dump
 tests/termination/fixtures/
 tests/byte/fixtures/
+tests/asm/.tmp/
 fuzz-corpus/
 fuzz-crashes/
 

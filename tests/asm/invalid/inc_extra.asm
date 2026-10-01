@@ -1,0 +1,2 @@
+INC R0, R1
+HALT

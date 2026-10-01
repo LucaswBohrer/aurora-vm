@@ -1,0 +1,2 @@
+FOO R0
+HALT

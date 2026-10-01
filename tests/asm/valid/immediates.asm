@@ -1,0 +1,11 @@
+; Immediate boundary values for class I (any 32-bit pattern).
+    MOV R0, 2147483647
+    MOV R1, -2147483648
+    MOV R2, 4294967295
+    MOV R3, 0xFFFFFFFF
+    MOV R4, -0x80000000
+    MOV R5, 0b11111111111111111111111111111111
+    ADD R0, -1
+    SUB R1, 0x7FFFFFFF
+    OUT R0
+    HALT

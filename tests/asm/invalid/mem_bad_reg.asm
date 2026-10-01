@@ -1,0 +1,2 @@
+LOAD R0, [R16]
+HALT

@@ -1,0 +1,2 @@
+JMP 7
+HALT

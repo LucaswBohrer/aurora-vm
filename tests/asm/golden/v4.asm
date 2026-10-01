@@ -1,0 +1,4 @@
+MOV R0, 10
+MOV R1, 20
+SUB R0, R1
+HALT

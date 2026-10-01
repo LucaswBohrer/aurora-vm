@@ -1,0 +1,3 @@
+MOV R1, 10
+MOV R0, R1
+HALT

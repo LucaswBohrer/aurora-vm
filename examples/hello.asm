@@ -1,9 +1,18 @@
-; examples/hello.asm — illustrative AURORA Assembly program.
+; examples/hello.asm -- Hello, world! via OUTC loop over a DB string.
 ;
-; Prints 42 to stdout and halts. The exit code is R0 & 0xFF = 42.
-; (The assembler that turns this into bytecode arrives in phase 5;
-;  the hand-assembled bytes are shown in README.md.)
+; Assembled with: python3 tools/aurora-asm examples/hello.asm -o hello.bin
+; Run with:       ./build/aurora run hello.bin
 
-MOV R0, 42
-OUT R0        ; prints R0 as signed decimal + newline
-HALT          ; exit code = R0 & 0xFF
+    MOV R0, msg        ; R0 = address of the string
+loop:
+    LOADB R1, [R0]     ; next byte
+    CMP R1, 0
+    JE done            ; null terminator ends the loop
+    OUTC R1            ; print one character
+    ADD R0, 1
+    JMP loop
+done:
+    MOV R0, 0        ; clean exit code
+    HALT
+
+msg: DB "Hello, world!", 10, 0

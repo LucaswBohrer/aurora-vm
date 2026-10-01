@@ -1,0 +1,3 @@
+loop:
+    JMP loop
+HALT

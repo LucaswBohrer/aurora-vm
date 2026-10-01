@@ -1,0 +1,2 @@
+POP R0
+HALT

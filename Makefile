@@ -29,6 +29,7 @@ test: $(BIN)
 	python3 tests/byte/audit_opcode_fields.py
 	python3 tests/exec/test_cpu_programs.py
 	python3 tests/termination/run_termination_tests.py
+	python3 tests/asm/run_asm_tests.py
 
 fuzz:
 	@echo "fuzzing is specified for a later phase (see docs/TESTING.md)"

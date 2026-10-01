@@ -1,0 +1,2 @@
+HALT
+DB R0
