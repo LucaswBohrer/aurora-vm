@@ -19,9 +19,10 @@ L4  Execution tests     sample programs, torture tests, stress program
 L5  Fuzzing             mutational bytecode fuzzing, safety oracle
 L6  Determinism         repeated runs, byte-identical results
 L7  Debugger            scripted REPL sessions
+L8  Runtime ABI         service contract, memory safety, golden fixtures
 ```
 
-`make test` runs L1–L4, L6, L7. `make fuzz` runs L5 (bounded iterations).
+`make test` runs L1–L4, L6, L7, L8. `make fuzz` runs L5 (bounded iterations).
 
 ---
 
@@ -248,7 +249,47 @@ asserting:
 
 ---
 
-## 9. Test harness conventions
+## 9. L8 — Runtime ABI tests
+
+Automated in `tests/runtime/run_runtime_tests.py` (38 checks, run via
+`make test`), pinning the contract in `docs/RUNTIME.md` (ABI v1,
+`runtime/aurora_rt.asm`):
+
+- **ABI contract:** `svc_write` returns the byte count; R3–R15 preserved
+  bit-identically across a service; R1/R2 clobbered as documented;
+  FLAGS clobbered (no save/restore possible in the ISA);
+- **svc_exit:** exit 0 silent; exit 42; exit 106 is NORMAL/HALT (D22 —
+  `aurora: error:` must NOT appear); `R0 = 256` wraps to exit 0;
+- **svc_write:** fd ≠ 1 → `-1`; `len = 0` → `0` without touching the
+  buffer; `buf = 0xFFFF, len = 2` → `-1`; huge/`2^63`-bit addresses and
+  lengths → `-1`; high-address valid buffer (`0xEFFB`, 5 bytes) written
+  correctly; read from address 0 (code) allowed;
+- **svc_read:** 5-byte read + echo; empty stdin → `0` (not an error);
+  short read; `len = 0` leaves the buffer untouched; fd ≠ 0 → `-1`;
+  out-of-range buffer → `-1`; read into the code segment → FATAL
+  `WRITE_TO_CODE` (exit 111), proving the runtime never masks ISA faults;
+- **memory safety:** PC continues after `CALL`; an unrelated 64-bit
+  pattern at `0x2000` survives both services; debugger `regs` shows
+  `SP = FP = 0x10000` after a service;
+- **debugger:** breakpoint at/after the `CALL`, `step 3` into the library
+  (`SP = 0xFFE0` after CALL + two PUSHes), `continue` to HALT,
+  `R0 = 5` visible after return, `reset` re-runs the service;
+- **determinism:** write and read runs byte-identical on repetition;
+- **IO_ERROR propagation:** `stdout → /dev/full` gives FATAL `IO_ERROR`
+  (exit 112) through the service, exactly as for a direct `OUTC`;
+- **independence (L1 principle):** frozen golden `.bin` fixtures
+  (`tests/runtime/fixtures/`) generated once by the assembler and
+  hand-verified (header fields + `disasm` spot check), run without any
+  assembler involvement; plus one fully hand-encoded program (Python
+  `struct`, no assembler, no library) printing `Hi`.
+
+Test programs link the guest FIRST (`cat prog.asm runtime/aurora_rt.asm`)
+so entry 0 is guest code; the guest/debugger stdin conflict means
+debugger sessions only exercise `svc_write`/`svc_exit`.
+
+---
+
+## 10. Test harness conventions
 
 - Runner: `tests/run_tests.sh` (POSIX sh). Each test prints
   `PASS`/`FAIL: <name> (<reason>)`; the suite exits nonzero on any
@@ -266,7 +307,7 @@ asserting:
 
 ---
 
-## 10. Normative termination tests (D22)
+## 11. Normative termination tests (D22)
 
 These tests prove the termination model of `ISA.md` §6.1.1: the exit code,
 in isolation, does not classify a run. Each test asserts the full

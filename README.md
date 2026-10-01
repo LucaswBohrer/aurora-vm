@@ -163,9 +163,17 @@ Full normative specification: [`docs/BYTECODE.md`](docs/BYTECODE.md).
 - register dump, memory dump, stack view, backtrace
 - distinguishes `halted (exit code N)` from `fatal error: <NAME>`
 
+## Runtime ABI
+
+`runtime/aurora_rt.asm` (phase 6) — a guest-side service library in AURORA
+assembly (frozen ISA, no traps): `svc_exit`, `svc_write`, `svc_read`.
+Guest programs link it by concatenation and `CALL` the entry points;
+arguments in R0–R2, return in R0, R3–R15/SP/FP preserved.
+Full contract: [`docs/RUNTIME.md`](docs/RUNTIME.md).
+
 ## Testing
 
-Seven layers ([`docs/TESTING.md`](docs/TESTING.md)):
+Eight layers ([`docs/TESTING.md`](docs/TESTING.md)):
 
 ```text
 L1 Golden Vectors        byte-exact vectors, assembler-independent (normative)
@@ -175,6 +183,7 @@ L4 Execution / Torture   CPU, memory, stack, flags; fib(30) stress program
 L5 Fuzzing               mutational bytecode fuzzing, no hangs/crashes
 L6 Determinism           repeated runs are bit-identical
 L7 Debugger              scripted interactive sessions
+L8 Runtime ABI           service contract, memory safety, golden fixtures
 ```
 
 ## Build
@@ -193,7 +202,9 @@ Produces the static binary `build/aurora` (no libc).
 make test
 ```
 
-Runs the phase test suites. Current: 24/24 CLI tests green.
+Runs the phase test suites (`make test`): L1–L4, L6, L7, L8 — all green
+(CLI, bytecode, opcode audit, CPU, termination, assembler, debugger,
+runtime ABI).
 
 ## Fuzzing
 
@@ -217,14 +228,16 @@ aurora-vm/
 │   ├── debug.asm   # `aurora debug`
 │   └── loader.asm  # bytecode loader (phase 2)
 ├── tools/          # assembler — Python 3 stdlib only (phase 4)
-├── programs/       # sample AURORA programs (phase 6)
+├── runtime/        # ABI v1 guest-side library (phase 6)
+├── programs/       # sample AURORA programs (phase 4)
 ├── tests/          # test suites per phase + golden vectors
 ├── docs/           # normative specifications
 │   ├── ARCHITECTURE.md
 │   ├── ISA.md
 │   ├── BYTECODE.md
 │   ├── DECISIONS.md
-│   └── TESTING.md
+│   ├── TESTING.md
+│   └── RUNTIME.md
 ├── examples/       # illustrative AURORA Assembly sources
 └── Makefile
 ```
@@ -238,8 +251,10 @@ aurora-vm/
 - [`docs/BYTECODE.md`](docs/BYTECODE.md) — **normative** file format and
   loader validation rules
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — architectural decision log
-  (D01–D21)
-- [`docs/TESTING.md`](docs/TESTING.md) — the 7 test layers
+  (D01–D26)
+- [`docs/TESTING.md`](docs/TESTING.md) — the 8 test layers
+- [`docs/RUNTIME.md`](docs/RUNTIME.md) — **normative** runtime ABI v1:
+  services, argument/return conventions, memory safety
 
 ## Status
 
@@ -251,8 +266,9 @@ aurora-vm/
 | 3 | CPU core: 43 handlers, flags, memory, stack, I/O | ✅ done |
 | 4 | Assembler (Python 3 stdlib) + sample programs | ✅ done |
 | 5 | Interactive debugger | ✅ done |
-| 6 | Fib(30) stress + full program suite | ⬜ planned |
-| 7 | Full suite + fuzzing + final docs | ⬜ planned |
+| 6 | Runtime ABI & services (guest-side library, D26) | ✅ done |
+| 7 | Fib(30) stress + full program suite | ⬜ planned |
+| 8 | Full suite + fuzzing + final docs | ⬜ planned |
 
 Only phases marked ✅ are implemented. Nothing above is presented as working
 before it is observed working.

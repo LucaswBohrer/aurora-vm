@@ -337,3 +337,34 @@ top-level handler frame where the stack layout is known.
 
 **Consequences:** I/O errors remain fatal (`IO_ERROR`, exit 100+id) with a
 safe unwind. No behavior change on success.
+
+## D26 — Runtime as a guest-side library: no trap in a frozen ISA (2026-10-01)
+
+**Context:** Phase 6 asks for an "ABI / services" layer: structured exit
+and I/O for guest programs. The ISA is frozen at 43 opcodes (D01): no
+`SYSCALL`, `TRAP`, `SERVICE`, or `CALL_HOST` exists, and no opcode may be
+added or given new semantics. A host-side dispatch smuggled into `IN`,
+`OUT`, `OUTC`, `HALT`, or a "reserved" `CALL` target would be a silent ISA
+change: every `CALL` target must satisfy `addr < code_size ∧ addr % 8 = 0`
+(ISA §6.8, loader-enforced), and `IN`/`OUT`/`OUTC`/`HALT` semantics are
+pinned by ISA §6.10/§6.1. The phase authorization is explicit: if a clean
+ABI cannot exist on current mechanisms, stop and report incompatibility.
+
+**Decision:** The ABI is a **calling convention over existing
+instructions**, implemented as a guest-side library
+(`runtime/aurora_rt.asm`, AURORA assembly, 43 frozen opcodes only). A
+service is identified by the entry point `CALL`ed (`svc_exit`,
+`svc_write`, `svc_read`); there are no service numbers and no
+multiplexed trap. The library reaches the host only through the existing
+`IN`/`OUTC`/`HALT` handlers — the same way a C library is a calling
+convention over real syscalls. There is exactly one CPU, one register
+file, one PC, one memory: services run as ordinary guest instructions
+through `cpu_step()`.
+
+**Consequences:** ISA, bytecode, encoding, calling convention, error IDs,
+and D22 are untouched (see `docs/RUNTIME.md` for the full conformance
+argument). Linking is static by concatenation; `svc_`-prefixed labels are
+reserved. Services introduce no new fatal errors — host I/O failures and
+code-segment stores propagate as the ISA's own `IO_ERROR` /
+`WRITE_TO_CODE`. Determinism (ISA §9) is preserved: no clock, no random,
+no nondeterministic service in ABI v1.

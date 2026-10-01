@@ -408,6 +408,23 @@ memory <addr> [count] | stack [n] | disasm | backtrace | help | quit
 - `backtrace` walks the FP chain (possible thanks to uniform frames, §2.8).
 - The debugger shares the CPU loop — it is not a second implementation.
 
+## 6b. Runtime ABI design (guest-side library, `runtime/aurora_rt.asm`)
+
+Phase 6 adds an ABI/services layer without touching the frozen ISA (D26).
+The ABI is a **calling convention over existing instructions**: services
+are ordinary AURORA functions in `runtime/aurora_rt.asm`, identified by
+the entry point `CALL`ed — `svc_exit` (terminate via `HALT`), `svc_write`
+(structured stdout via `OUTC` + `LOADB`), `svc_read` (structured stdin
+via `IN` + `STOREB`). Arguments in R0–R2, return value in R0 (`-1` =
+recoverable error: bad fd, bad bounds — wraparound-safe
+`buf > 0x10000 − len` check per ISA §5); R3–R15/SP/FP preserved, R1/R2
+and FLAGS clobbered. Linking is static by concatenation (guest FIRST so
+entry 0 is guest code; `svc_`-prefixed labels reserved). One CPU, one
+register file, one memory — services execute through `cpu_step()` like
+any guest code; fatal errors inside a service propagate as the ISA's own
+`IO_ERROR`/`WRITE_TO_CODE`. Deterministic: no clock, no random
+(`docs/RUNTIME.md` is the normative ABI reference).
+
 ---
 
 ## 7. Project structure
@@ -428,10 +445,15 @@ aurora-vm/
 │   └── util.asm        ; string/hex/parse helpers
 ├── tools/
 │   └── aurora-asm      ; assembler (Python 3, stdlib only, executable)
+├── runtime/
+│   └── aurora_rt.asm   ; ABI v1 guest-side library (svc_exit/svc_write/svc_read)
 ├── programs/           ; 7 sample programs (.asm)
+├── examples/
+│   └── runtime/        ; hello/io/echo/exit via the runtime ABI (.asm)
 ├── tests/
 │   ├── run_tests.sh    ; runner
 │   ├── cpu/  mem/  stack/  asm/  byte/  vm/   ; fixtures + expectations
+│   ├── runtime/        ; L8 ABI tests + frozen golden .bin fixtures
 │   └── helpers.sh
 ├── docs/
 │   ├── ARCHITECTURE.md ; this file (evolves into the decision record)
@@ -439,6 +461,7 @@ aurora-vm/
 │   ├── BYTECODE.md     ; file format + loader validation rules
 │   ├── ASSEMBLER.md    ; syntax + directives + diagnostics
 │   ├── DEBUGGER.md     ; commands + examples
+│   ├── RUNTIME.md      ; runtime ABI v1 contract (normative, phase 6)
 │   ├── MEMORY.md       ; memory & stack model
 │   ├── ERRORS.md       ; error model + exit codes
 │   └── BUILD_TEST.md   ; build/run/test/clean instructions
@@ -482,6 +505,13 @@ aurora-vm/
   - **L7 debugger:** scripted REPL sessions asserting output formats,
     stepping, breakpoints, memory/stack dumps, backtraces, and the
     halted-vs-fatal-error distinction.
+  - **L8 runtime ABI** (`tests/runtime/`, 38 checks): the §6b contract —
+    argument/return conventions, R3–R15/SP/FP preservation, `svc_exit`
+    (0/42/106-normal per D22), `svc_write`/`svc_read` (valid, zero-length,
+    boundary, invalid, overflow, EOF), memory safety (no unrelated
+    corruption), debugger sessions over service calls, determinism,
+    `IO_ERROR` propagation through services, and frozen golden `.bin`
+    fixtures plus one fully hand-encoded program (assembler-independent).
 - Every test asserts **observable behavior** (stdout bytes + exit code +
   debugger-visible state), never implementation internals.
 
