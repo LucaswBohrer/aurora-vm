@@ -193,22 +193,47 @@ to 64 bits; `mem64[a]` / `mem8[a]` = checked memory access.
 
 #### 6.1.1 HALT vs. fatal error (normative)
 
-`HALT` and fatal errors are **disjoint, machine-checkable categories**:
+Every execution ends in exactly one of two **termination classes**,
+identified by the VM's internal `termination_reason` — **not** by the
+process exit code alone:
 
+```text
+HALT:
+    termination_class  = NORMAL
+    termination_reason = HALT
+    exit_code          = R0 & 0xFF        (0–255)
+
+fatal error:
+    termination_class  = FATAL
+    termination_reason = <specific error>  (e.g. DIVISION_BY_ZERO)
+    exit_code          = 100 + error_id    (101–112)
 ```
-HALT         → normal termination, exit code = R0 & 0xFF   (0–255)
-fatal error  → abnormal termination, exit code = 100 + id  (101–112)
-```
+
+**The exit code, in isolation, does NOT determine whether execution
+ended normally or fatally.** `HALT` can produce any value in `0–255`,
+so the ranges overlap: `HALT` with `R0 = 106` exits `106`, and
+`DIVISION_BY_ZERO` also exits `106`. Same exit code ≠ same termination.
+The classification is made by `termination_class`/`termination_reason`
+inside the VM; for external observers, by the termination status the VM
+reports (and, for fatal errors, the `aurora: error: <NAME>[: <detail>]`
+line on stderr — a `HALT` never prints one).
 
 - `HALT ≠ runtime error`, in all cases. A program ending in `HALT` with
-  `R0 = 0` exits `0` — that is success, not an error.
+  `R0 = 0` exits `0` — that is success, not an error. A program ending
+  in `HALT` with `R0 = 106` exits `106` — still success, not
+  `DIVISION_BY_ZERO`.
 - The VM **never** continues after a fatal error; it prints
-  `aurora: error: <NAME>: <detail>` to stderr and exits `100 + id`.
+  `aurora: error: <NAME>[: <detail>]` to stderr and exits `100 + id`.
 - The debugger must distinguish the two states with different status
   lines (see `docs/DEBUGGER.md`): `halted (exit code N)` vs.
-  `fatal error: <NAME>`.
-- Tests assert the category by exit code **and** by the error name on
-  stderr (see `docs/TESTING.md` §9).
+  `fatal error: <NAME>` — even when `N` is numerically equal to a fatal
+  error's exit code.
+- Tests assert the `(termination_class, termination_reason, exit_code)`
+  triple, never the exit code alone (see the normative termination tests
+  in `docs/TESTING.md` §10).
+
+Neither the `HALT` opcode (`0x01`), the error ids (1–12), nor any exit
+code value is changed by this clarification (see D22).
 
 ### 6.2 Data movement
 

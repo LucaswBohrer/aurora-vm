@@ -265,12 +265,17 @@ with code `100 + id`:
 The VM **never** continues after a fatal error. There are no warnings —
 anything malformed is rejected.
 
-**HALT ≠ fatal error (normative).** `HALT` is normal termination:
-exit code `R0 & 0xFF` (0–255). Fatal errors are a disjoint category:
-exit code `100 + id` (101–112), with `aurora: error: <NAME>: <detail>`
-on stderr. The debugger reports them with different status lines
+**HALT ≠ fatal error (normative).** Every execution ends with a
+`termination_class` of `NORMAL` or `FATAL`, decided by the VM's internal
+`termination_reason` — not by the exit code alone. `HALT` terminates
+normally: `termination_reason = HALT`, exit code `R0 & 0xFF` (0–255).
+Fatal errors terminate fatally: `termination_reason = <error name>`,
+exit code `100 + id` (101–112), with `aurora: error: <NAME>[: <detail>]`
+on stderr. Because `HALT` can exit with any value in 0–255, the numeric
+ranges overlap (`HALT` with `R0 = 106` and `DIVISION_BY_ZERO` both exit
+`106`); the debugger reports them with different status lines
 (`halted (exit code N)` vs `fatal error: <NAME>`). Full formalization in
-`ISA.md` §6.1.1.
+`ISA.md` §6.1.1; decision record D22.
 
 ### 2.11 CLI
 
@@ -466,7 +471,11 @@ aurora-vm/
   - **L5 fuzzing** (`make fuzz`, `tests/fuzz.py`): mutational fuzzing of
     headers, versions, opcodes, operands, class bytes, immediates,
     entry points, sizes and truncations. Oracle: no signal death, no
-    hang past `--max-steps`, exit code always in `{0} ∪ {101..112}`.
+    hang past `--max-steps`, and the `(exit code, stderr)` pair must be
+    consistent with the termination class — a fatal error exits
+    `100 + id` *and* names the error on stderr; a `HALT` (any exit code
+    0–255) never prints `aurora: error:`. Exit code alone is not a
+    classifier (see D22).
   - **L6 determinism:** every program and vector runs twice;
     byte-identical results required. Only stdin (`IN`) is a legitimate
     nondeterminism source.

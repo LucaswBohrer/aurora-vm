@@ -94,6 +94,13 @@ Fatal errors exit with `100 + id` (101–112).
 **Consequences:** Tests can assert computed values via exit codes;
 `HALT` and fatal errors are disjoint, machine-checkable categories.
 
+> **Amended by D22 (2026-10-01):** the "disjoint, machine-checkable
+> categories" consequence was incorrect *as a claim about exit codes*:
+> `HALT` exits `R0 & 0xFF` (0–255), which overlaps the fatal-error range
+> 101–112. The categories remain disjoint — but the classifier is the
+> VM's `termination_class`/`termination_reason`, not the exit code
+> alone. Nothing about opcodes, error ids or exit-code values changed.
+
 ## D10 — 2026-10-01 — Stack is a reserved region of the 64 KiB
 
 **Decision:** `0xF000–0xFFFF`, 4 KiB, grows down; `SP`/`FP` init
@@ -158,6 +165,13 @@ operands, class bytes, immediates, entry points, sizes and truncations.
 Oracle: the VM must never segfault, hang past `--max-steps`, or exit
 with a code outside `{0} ∪ {101..112}`.
 
+> **Amended by D22 (2026-10-01):** the `{0} ∪ {101..112}` oracle wording
+> was incorrect — `HALT` can legally exit with any code in `0–255`, so
+> the oracle is now stated as an `(exit code, stderr)` consistency check
+> against the termination class: a fatal error must exit `100 + id`
+> *and* name the error on stderr; a `HALT` never prints
+> `aurora: error:`. The exit code alone is not a classifier.
+
 **Consequences:** A clear safety bar against malformed inputs, enforced
 in the test suite.
 
@@ -210,3 +224,43 @@ stdin/stdout failure during execution.
 **Consequences:** `make test` (phase 1) asserts these codes. The `run`
 subcommand validates `--max-steps` with an overflow-checked u64 parser
 (empty string, non-digits, negative and >2^64-1 rejected).
+
+## D22 — 2026-10-01 — Termination model: exit code is not a classifier
+
+**Problem:** `HALT` exits with `R0 & 0xFF` (0–255) while fatal errors
+exit with `100 + id` (101–112). The ranges overlap: `HALT` with
+`R0 = 106` exits `106`, exactly like `DIVISION_BY_ZERO`. The spec
+claimed the two categories were "disjoint, machine-checkable" by exit
+code — that claim was wrong.
+
+**Decision:** Keep both rules exactly as specified — `HALT` exits
+`R0 & 0xFF`, fatal errors exit `100 + id`. No opcode, error id, exit
+code value, bytecode format or calling convention changes. Instead,
+define formally that **the exit code, in isolation, does not determine
+whether execution ended normally or fatally**. Every execution ends
+with a VM-internal `termination_class` (`NORMAL` / `FATAL`) and a
+`termination_reason` (`HALT` or the specific error name):
+
+- `HALT` → `termination_class = NORMAL`, `termination_reason = HALT`,
+  `exit_code = R0 & 0xFF`;
+- fatal error → `termination_class = FATAL`,
+  `termination_reason = <error name>`, `exit_code = 100 + id`.
+
+The debugger distinguishes `halted (exit code N)` from
+`fatal error: <NAME>` even when `N` is numerically equal to a fatal
+error's exit code. Tests assert the
+`(termination_class, termination_reason, exit_code)` triple, never the
+exit code alone.
+
+**Why the overlap is acceptable:** the exit code is a lossy 8-bit
+channel to the host OS; it was never meant to carry the termination
+semantics. The VM's own termination state is the source of truth, and
+fatal errors additionally announce themselves on stderr
+(`aurora: error: <NAME>[: <detail>]`), which a `HALT` never prints.
+
+**Consequences:** `ISA.md` §6.1.1 rewritten around the termination
+model; `ARCHITECTURE.md` error-model and L5 oracle corrected; the L5
+fuzzing oracle is now an `(exit code, stderr)` consistency check against
+the termination class; `TESTING.md` §10 adds five normative termination
+tests (T1–T5) proving that identical exit codes can mean different
+terminations; D09 and D16 carry amendment notes (history preserved).

@@ -20,6 +20,7 @@ build/obj/%.o: src/%.asm
 
 test: $(BIN)
 	tests/phase1/run_cli_tests.sh
+	python3 tests/termination/run_termination_tests.py
 
 fuzz:
 	@echo "fuzzing is specified for a later phase (see docs/TESTING.md)"

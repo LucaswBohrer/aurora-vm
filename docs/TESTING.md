@@ -193,7 +193,11 @@ reproducibility):
 - entry: 0, misaligned, `code_size`, huge.
 
 **Oracle** (per iteration, `--max-steps 10000`, timeout 10 s):
-- process must exit with code in `{0} ∪ {101..112}`;
+- the `(exit code, stderr)` pair must be consistent with the termination
+  class: a fatal error must exit `100 + id` **and** print
+  `aurora: error: <NAME>` on stderr; a `HALT` (any exit code 0–255)
+  must never print `aurora: error:`. Exit code alone is not a
+  classifier (D22);
 - must not die by signal (segfault/abort → FAIL with the input saved to
   `tests/fuzz_crashes/`);
 - must not exceed the timeout;
@@ -245,9 +249,52 @@ Scripted sessions (`printf ... | aurora debug prog.bin`), asserting:
   failure and prints a summary count.
 - Assembler-error tests match stderr with `grep -F` on the
   `file:line: error:` prefix plus the category word.
-- VM-error tests match exit code **and** the error name on stderr
-  (`aurora: error: DIVISION_BY_ZERO …`).
+- VM-error tests match the `(termination_class, termination_reason,
+  exit_code)` triple: exit code **and** the error name on stderr
+  (`aurora: error: DIVISION_BY_ZERO …`). A bare exit-code match is not
+  sufficient — see the normative termination tests in §10.
 - New tests are added as data (`.asm` + `.expected` / `.bin` + expectations),
   not as harness code, wherever possible.
 - No network, no absolute paths, no host-specific assumptions.
   `python3` required only for fixture generation and fuzzing.
+
+---
+
+## 10. Normative termination tests (D22)
+
+These tests prove the termination model of `ISA.md` §6.1.1: the exit code,
+in isolation, does not classify a run. Each test asserts the full
+`(termination_class, termination_reason, exit_code)` triple.
+
+| Test | Program | termination_class | termination_reason | exit_code |
+|------|---------|-------------------|--------------------|-----------|
+| T1 | `MOV R0, 0` · `HALT` | NORMAL | HALT | 0 |
+| T2 | `MOV R0, 106` · `HALT` | NORMAL | HALT | 106 |
+| T3 | `MOV R1, 10` · `MOV R2, 0` · `DIV R1, R2` · `HALT` | FATAL | DIVISION_BY_ZERO | 106 |
+| T4 | `MOV R0, 105` · `HALT` | NORMAL | HALT | 105 |
+| T5 | `POP R0` · `HALT` | FATAL | STACK_UNDERFLOW | 105 |
+
+The decisive assertions:
+
+- **T2 vs T3:** same exit code (`106`) ≠ same termination —
+  `NORMAL/HALT` vs `FATAL/DIVISION_BY_ZERO`. T3 must also print
+  `aurora: error: DIVISION_BY_ZERO …` on stderr; T2 must not print any
+  `aurora: error:` line.
+- **T4 vs T5:** same principle for a second overlapping error —
+  `NORMAL/HALT` with exit `105` vs `FATAL/STACK_UNDERFLOW` with exit
+  `105` (`POP` on the empty stack: initial `SP = 0x10000` violates the
+  `SP < 0x10000` precondition).
+
+Byte-level fixtures (hand-derived from the frozen spec, assembler-
+independent like the L1 golden vectors) live in
+`tests/termination/`: `.asm` sources, a manifest with the exact code
+bytes and the expected triples, and `run_termination_tests.py`, which
+rebuilds the `.bin` files, checks the size equation
+(`file_size == 0x1A + code_size + data_size`), the header fields, and
+an independent per-slot scan (opcode range, class tag, register fields,
+imm32 rules). The execution half of the assertions — running each
+fixture under `aurora run` and checking the reported termination triple —
+is wired into L4 and runs once the CPU exists (phase 3); until then the
+script validates fixtures and skips execution with a clear message.
+
+No test in this section may assert a category from the exit code alone.
