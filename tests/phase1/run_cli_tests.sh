@@ -28,6 +28,20 @@ fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+# Minimal valid program (docs/BYTECODE.md §6): single HALT, 34 bytes.
+# Phase 2: the loader is real, so these tests use a *valid* file; an empty
+# file is now (correctly) rejected with INVALID_PROGRAM (see L3 suite).
+python3 -c "
+import sys
+sys.stdout.buffer.write(bytes.fromhex(
+    '4155524f52410100'  # magic
+    '0100'              # version 0x0001
+    '08000000'          # code_size = 8
+    '00000000'          # entry = 0
+    '00000000'          # data_size = 0
+    '00000000'          # reserved
+    '01ffff0000000000'  # HALT
+))" > "$TMP/halt.bin"
 touch "$TMP/empty.bin"
 
 run_test "help-long"            0 "Usage:" --help
@@ -37,11 +51,12 @@ run_test "version-short"        0 "aurora 1.0.0" -V
 run_test "no-args-shows-help"   0 "Usage:"
 run_test "run-missing-file"     2 "run: missing file operand" run
 run_test "run-nonexistent"      2 "run: cannot open"              run "$TMP/nope.bin"
-run_test "run-stub"             3 "not implemented in this build" run "$TMP/empty.bin"
-run_test "run-maxsteps-eq"      3 "not implemented in this build" run "$TMP/empty.bin" --max-steps=1000
-run_test "run-maxsteps-space"   3 "not implemented in this build" run "$TMP/empty.bin" --max-steps 1000
-run_test "run-maxsteps-zero"    3 "not implemented in this build" run "$TMP/empty.bin" --max-steps 0
-run_test "run-maxsteps-u64max"  3 "not implemented in this build" run "$TMP/empty.bin" --max-steps 18446744073709551615
+run_test "run-noexec"           3 "not implemented in this build" run "$TMP/halt.bin"
+run_test "run-empty-file"       108 "INVALID_PROGRAM"             run "$TMP/empty.bin"
+run_test "run-maxsteps-eq"      3 "not implemented in this build" run "$TMP/halt.bin" --max-steps=1000
+run_test "run-maxsteps-space"   3 "not implemented in this build" run "$TMP/halt.bin" --max-steps 1000
+run_test "run-maxsteps-zero"    3 "not implemented in this build" run "$TMP/halt.bin" --max-steps 0
+run_test "run-maxsteps-u64max"  3 "not implemented in this build" run "$TMP/halt.bin" --max-steps 18446744073709551615
 run_test "run-maxsteps-bad"     2 "invalid value for --max-steps" run "$TMP/empty.bin" --max-steps abc
 run_test "run-maxsteps-empty"   2 "invalid value for --max-steps" run "$TMP/empty.bin" --max-steps=
 run_test "run-maxsteps-neg"     2 "invalid value for --max-steps" run "$TMP/empty.bin" --max-steps -5
@@ -52,7 +67,8 @@ run_test "run-extra-operand"    2 "run: unexpected operand 'extra'" run "$TMP/em
 run_test "unknown-command"      2 "unknown command 'frobnicate'" frobnicate
 run_test "debug-missing-file"   2 "expected exactly one file operand" debug
 run_test "debug-nonexistent"    2 "debug: cannot open"            debug "$TMP/nope.bin"
-run_test "debug-stub"           3 "not implemented in this build" debug "$TMP/empty.bin"
+run_test "debug-noexec"         3 "not implemented in this build" debug "$TMP/halt.bin"
+run_test "debug-empty-file"     108 "INVALID_PROGRAM"             debug "$TMP/empty.bin"
 run_test "debug-extra-operand"  2 "expected exactly one file operand" debug "$TMP/empty.bin" extra
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

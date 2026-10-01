@@ -16,6 +16,7 @@ venv/
 *.log
 *.dump
 tests/termination/fixtures/
+tests/byte/fixtures/
 fuzz-corpus/
 fuzz-crashes/
 

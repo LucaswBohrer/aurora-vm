@@ -1,13 +1,13 @@
 ; src/debug.asm — `aurora debug <file>`.
 ;
-; Phase 1: operand validation + host-side file open check, then hands
-; off to loader_load_file (a phase-1 stub; loader = phase 2, debugger =
-; phase 4).
+; Phase 2: operand validation + host-side file open check, then hands
+; off to loader_load_file (real bytecode loader; debugger = phase 4).
 
 default rel
 
 global cmd_debug
 
+extern print_fd
 extern cli_error_with_arg
 extern host_open_error
 extern loader_load_file
@@ -19,6 +19,8 @@ extern loader_load_file
 section .rodata
 s_usage:       db "debug: expected exactly one file operand", 0
 s_cannot_open: db "debug: cannot open", 0
+s_nodebug:     db "aurora: debug: debugger not implemented in this build (phase 2)", 10
+s_nodebug_len equ $ - s_nodebug
 
 section .text
 
@@ -43,7 +45,16 @@ cmd_debug:
 
     mov rdi, rbx
     xor esi, esi                ; no max_steps in debug mode
-    call loader_load_file       ; phase-1 stub: exits 3
+    call loader_load_file       ; 0 on success; fatal errors never return
+    ; Phase 2 ends here: the program validated and loaded, but the
+    ; debugger does not exist yet (phase 4).
+    mov edi, 2
+    lea rsi, [s_nodebug]
+    mov edx, s_nodebug_len
+    call print_fd
+    mov eax, 60                 ; sys_exit
+    mov edi, 3                  ; scaffolding exit code (removed in phase 4)
+    syscall
     ud2
 
 .usage:

@@ -1,7 +1,10 @@
 ; src/run.asm — `aurora run <file> [--max-steps N]`.
 ;
-; Phase 1: full argument parsing + host-side file open check, then hands
-; off to loader_load_file (a phase-1 stub; the real loader is phase 2).
+; Phase 2: full argument parsing + host-side file open check, then hands
+; off to loader_load_file (real bytecode loader). The CPU does not exist
+; yet, so a successfully loaded program ends here with a phase-2
+; scaffolding message (exit 3); invalid programs are rejected by the
+; loader with INVALID_PROGRAM / INVALID_INSTRUCTION.
 
 default rel
 
@@ -10,6 +13,7 @@ global cmd_run
 extern streq
 extern starts_with
 extern parse_u64
+extern print_fd
 extern cli_error_with_arg
 extern host_open_error
 extern loader_load_file
@@ -28,6 +32,8 @@ s_cannot_open:   db "run: cannot open", 0
 s_maxsteps:      db "--max-steps", 0
 s_maxsteps_eq:   db "--max-steps=", 0
 s_maxsteps_eq_len equ 12
+s_noexec:        db "aurora: run: execution not implemented in this build (phase 2)", 10
+s_noexec_len equ $ - s_noexec
 
 section .text
 
@@ -133,7 +139,16 @@ cmd_run:
 
     mov rdi, rbx                ; path
     mov rsi, r12                ; max_steps (used from phase 3 on)
-    call loader_load_file       ; phase-1 stub: exits 3
+    call loader_load_file       ; 0 on success; fatal errors never return
+    ; Phase 2 ends here: the program validated and loaded, but the CPU
+    ; loop does not exist yet.
+    mov edi, 2
+    lea rsi, [s_noexec]
+    mov edx, s_noexec_len
+    call print_fd
+    mov eax, 60                 ; sys_exit
+    mov edi, 3                  ; scaffolding exit code (removed in phase 3)
+    syscall
     ud2
 
 .open_fail:

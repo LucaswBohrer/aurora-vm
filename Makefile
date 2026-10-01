@@ -18,8 +18,12 @@ build/obj/%.o: src/%.asm
 	mkdir -p build/obj
 	$(NASM) $(NASMFLAGS) $< -o $@
 
+# loader.o also depends on the shared VM layout include.
+build/obj/loader.o: src/vm.inc
+
 test: $(BIN)
 	tests/phase1/run_cli_tests.sh
+	tests/byte/run_l3_tests.sh
 	python3 tests/termination/run_termination_tests.py
 
 fuzz:
