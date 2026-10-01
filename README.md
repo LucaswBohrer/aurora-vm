@@ -125,15 +125,14 @@ The AURORA ISA is **frozen at exactly 43 opcodes** (`0x00`–`0x2A`) for v1:
 |-------|--------------|
 | System | `NOP`, `HALT` |
 | Data movement | `MOV` (reg/reg, reg/imm32) |
-| Arithmetic | `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `NEG` (reg and imm forms) |
-| Logic | `AND`, `OR`, `XOR`, `NOT`, `SHL`, `SHR` |
+| Arithmetic | `ADD`, `SUB`, `MUL`, `DIV`, `INC`, `DEC` (reg and imm forms) |
+| Logic | `AND`, `OR`, `XOR`, `NOT` |
 | Compare | `CMP` (sets Z/C/N/V flags) |
 | Control flow | `JMP`, `JE`, `JNE`, `JG`, `JL`, `JGE`, `JLE` (signed) |
 | Functions | `CALL`, `RET` (uniform frame: return address + saved `FP`) |
 | Stack | `PUSH`, `POP` |
 | Memory | `LOAD`, `STORE` (64-bit, unaligned-safe), `LOADB`, `STOREB` |
 | I/O | `OUT`, `OUTC`, `IN` |
-| Debug | `BREAK` |
 
 Every instruction is exactly 8 bytes:
 `[opcode:u8][dst:u8][src:u8][class:u8][imm32:LE]`.
