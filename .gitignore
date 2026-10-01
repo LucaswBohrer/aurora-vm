@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+*.o
+*.obj
+
+# Python (assembler tooling)
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+# Test / fuzz artifacts
+*.dat
+*.log
+*.dump
+fuzz-corpus/
+fuzz-crashes/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
